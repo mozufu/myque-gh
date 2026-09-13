@@ -28,16 +28,18 @@ import Myque.Github.Github (
     discoverGithub,
     encodePathSegment,
     getIssue,
+    getMilestone,
     getRepository,
     parseIssue,
+    parseMilestone,
     repoPath,
     restSingle,
  )
-import Myque.Github.Markers (MarkerError (..), parseIssueIdentity)
+import Myque.Github.Markers (MarkerError (..), parseIssueIdentity, parseMilestoneIdentity)
 import Myque.Github.Projection
 import Myque.Github.Source (resolveSourceRef)
 import Myque.Github.Types
-import Myque.Item (WorkItem (..), isTerminal)
+import Myque.Item (Kind (Milestone), WorkItem (..), isTerminal)
 import Myque.Query (Query, runQuery)
 import Myque.Store (Store (..))
 import Myque.Uuid (Uuid, uuidText)
@@ -59,7 +61,9 @@ selectProjection query snapshot =
 buildPlan :: Set.Set Uuid -> Target -> Snapshot -> GithubSnapshot -> Either [Conflict] Plan
 buildPlan querySelected target snapshot github = do
     let
-        retained = Map.keysSet (Map.intersection canonical (githubIssueByUuid github))
+        retained =
+            Map.keysSet (Map.intersection canonical (githubIssueByUuid github))
+                `Set.union` Map.keysSet (Map.filter ((== Milestone) . itemKind) (Map.intersection canonical (githubMilestoneByUuid github)))
         projected = parentClosure canonical (querySelected `Set.union` retained)
         selected = [(uuid, item) | (uuid, item) <- Map.toAscList canonical, Set.member uuid projected]
         selectedItems = map snd selected
@@ -68,6 +72,9 @@ buildPlan querySelected target snapshot github = do
     let issueNumbers = Map.map githubIssueNumber (githubIssueByUuid github)
         context = ProjectionContext snapshot target issueNumbers
         desired = Map.fromList [(uuid, projectIssue context item (Map.findWithDefault [] uuid (githubPrsByUuid github))) | (uuid, item) <- selected]
+        desiredMilestones = Map.fromList [(uuid, projectMilestone context item) | (uuid, item) <- selected, itemKind item == Milestone]
+        milestoneCreates = Map.difference desiredMilestones (githubMilestoneByUuid github)
+        milestoneChanges = Map.filterWithKey (\uuid want -> maybe False (milestoneDrift want) (Map.lookup uuid (githubMilestoneByUuid github))) desiredMilestones
         creates = Map.filterWithKey (\uuid _ -> not (Map.member uuid (githubIssueByUuid github))) desired
         changes =
             Map.fromList
@@ -91,7 +98,31 @@ buildPlan querySelected target snapshot github = do
             | (uuid, issue) <- Map.toAscList (githubIssueByUuid github)
             , not (Map.member uuid canonical)
             ]
-    pure Plan{planLabelCreates = labelCreates, planIssueCreates = creates, planIssueChanges = changes, planParentChanges = parentChanges, planWarnings = githubWarnings github <> orphanWarnings}
+        milestoneWarnings =
+            [ Warning "orphaned-milestone" ("milestone #" <> T.pack (show (githubMilestoneNumber milestone)) <> " no longer has a canonical milestone " <> uuidText uuid <> "; left unchanged")
+            | (uuid, milestone) <- Map.toAscList (githubMilestoneByUuid github)
+            , maybe True ((/= Milestone) . itemKind) (Map.lookup uuid canonical)
+            ]
+    milestoneTitleCheck desiredMilestones github
+    assignments <-
+        traverse
+            ( \(uuid, item) -> do
+                let parent = nearestMilestone snapshot item
+                pending <- milestoneAssignmentPending target github (Map.lookup uuid (githubIssueByUuid github)) parent
+                pure (uuid, (renderDisplay snapshot item, parent), pending)
+            )
+            selected
+    pure
+        Plan
+            { planLabelCreates = labelCreates
+            , planIssueCreates = creates
+            , planIssueChanges = changes
+            , planParentChanges = parentChanges
+            , planWarnings = githubWarnings github <> orphanWarnings <> milestoneWarnings
+            , planMilestoneCreates = milestoneCreates
+            , planMilestoneChanges = milestoneChanges
+            , planMilestoneAssignments = Map.fromList [(uuid, assignment) | (uuid, assignment, True) <- assignments]
+            }
   where
     store = snapshotStore snapshot
     canonical = storeById store
@@ -105,6 +136,52 @@ parentClosure canonical initial = go initial (Set.toList initial)
         Just parent
             | Set.member parent projected -> go projected rest
             | otherwise -> go (Set.insert parent projected) (parent : rest)
+
+milestoneDrift :: DesiredMilestone -> GithubMilestone -> Bool
+milestoneDrift desired actual =
+    desiredMilestoneTitle desired /= githubMilestoneTitle actual
+        || desiredMilestoneDescription desired /= githubMilestoneDescription actual
+        || desiredMilestoneState desired /= githubMilestoneState actual
+
+-- | Refuse ambiguous titles rather than adopting a human milestone by name.
+milestoneTitleCheck :: Map.Map Uuid DesiredMilestone -> GithubSnapshot -> Either [Conflict] ()
+milestoneTitleCheck desired github = case duplicateTitles <> occupiedTitles of
+    [] -> Right ()
+    values -> Left values
+  where
+    titles = Map.fromListWith (<>) [(T.toCaseFold (desiredMilestoneTitle want), [uuid]) | (uuid, want) <- Map.toAscList desired]
+    duplicateTitles = [Conflict "milestone-title-conflict" ("canonical milestones share title " <> title) | (title, uuids) <- Map.toAscList titles, length uuids > 1]
+    occupiedTitles =
+        [ Conflict "milestone-title-conflict" (desiredMilestoneTitle want <> " is already used by milestone #" <> T.pack (show (githubMilestoneNumber actual)))
+        | (uuid, want) <- Map.toAscList desired
+        , actual <- githubMilestones github
+        , T.toCaseFold (desiredMilestoneTitle want) == T.toCaseFold (githubMilestoneTitle actual)
+        , Just (githubMilestoneNumber actual) /= (githubMilestoneNumber <$> Map.lookup uuid (githubMilestoneByUuid github))
+        ]
+
+{- | No canonical group leaves human membership alone. Only trusted native
+projections may be replaced or cleared; a human assignment is a conflict.
+-}
+milestoneAssignmentPending :: Target -> GithubSnapshot -> Maybe GithubIssue -> Maybe Uuid -> Either [Conflict] Bool
+milestoneAssignmentPending target github issue desired = case issue >>= githubIssueMilestone of
+    Nothing -> Right (isJust desired)
+    Just current -> case managedMilestoneIdentity target current of
+        Left message -> Left [Conflict "milestone-identity-conflict" message]
+        Right Nothing
+            | isNothing desired -> Right False
+            | otherwise -> Left [Conflict "milestone-assignment-conflict" ("issue #" <> maybe "?" (T.pack . show . githubIssueNumber) issue <> " belongs to a human or untrusted milestone #" <> T.pack (show (githubMilestoneNumber current)))]
+        Right (Just uuid) -> case Map.lookup uuid (githubMilestoneByUuid github) of
+            Just known
+                | githubMilestoneNumber known == githubMilestoneNumber current ->
+                    Right (Just (githubMilestoneNumber current) /= (desired >>= fmap githubMilestoneNumber . (`Map.lookup` githubMilestoneByUuid github)))
+            _ -> Left [Conflict "milestone-identity-conflict" "assigned milestone is absent from trusted discovery or has a duplicate identity"]
+
+managedMilestoneIdentity :: Target -> GithubMilestone -> Either Text (Maybe Uuid)
+managedMilestoneIdentity target milestone
+    | T.toCaseFold (githubMilestoneAuthor milestone) `Set.notMember` targetIssueAuthors target = Right Nothing
+    | otherwise = case parseMilestoneIdentity (githubMilestoneDescription milestone) of
+        Left (MarkerError message) -> Left message
+        Right uuid -> Right uuid
 
 expectedParentRef :: Target -> Map.Map Uuid Int -> Maybe Uuid -> Maybe GithubIssueRef
 expectedParentRef target numbers parent = do
@@ -178,6 +255,9 @@ renderPlan target snapshot plan =
                     <> ["+ issue " <> uuidText uuid <> " " <> desiredDisplay desired | (uuid, desired) <- Map.toAscList (planIssueCreates plan)]
                     <> concatMap renderIssue (Map.toAscList (planIssueChanges plan))
                     <> ["~ issue " <> uuidText uuid <> " " <> display <> " parent " <> maybe "none" uuidText parent | (uuid, (display, parent)) <- Map.toAscList (planParentChanges plan)]
+                    <> ["+ milestone " <> uuidText uuid <> " " <> desiredMilestoneTitle desired | (uuid, desired) <- Map.toAscList (planMilestoneCreates plan)]
+                    <> ["~ milestone " <> uuidText uuid <> " " <> desiredMilestoneTitle desired | (uuid, desired) <- Map.toAscList (planMilestoneChanges plan)]
+                    <> ["~ issue " <> uuidText uuid <> " " <> display <> " milestone " <> maybe "none" uuidText parent | (uuid, (display, parent)) <- Map.toAscList (planMilestoneAssignments plan)]
     renderIssue (number, (uuid, _display, changes)) = map (renderChange number uuid) changes
     renderChange number uuid change = case change of
         SetTitle _ -> field "title"
@@ -191,7 +271,14 @@ renderPlan target snapshot plan =
 
 -- | Test whether a plan contains no mutations.
 planIsEmpty :: Plan -> Bool
-planIsEmpty plan = null (planLabelCreates plan) && Map.null (planIssueCreates plan) && Map.null (planIssueChanges plan) && Map.null (planParentChanges plan)
+planIsEmpty plan =
+    null (planLabelCreates plan)
+        && Map.null (planIssueCreates plan)
+        && Map.null (planIssueChanges plan)
+        && Map.null (planParentChanges plan)
+        && Map.null (planMilestoneCreates plan)
+        && Map.null (planMilestoneChanges plan)
+        && Map.null (planMilestoneAssignments plan)
 
 -- | Apply a guarded plan, rediscover GitHub, and require convergence.
 reconcile :: Set.Set Uuid -> GithubClient -> SourceSpec -> Target -> Snapshot -> IO Plan
@@ -199,6 +286,15 @@ reconcile querySelected client spec target snapshot = withTargetLock target $ do
     initialGithub <- discoverGithub client target snapshot
     initialPlan <- either conflicts pure (buildPlan querySelected target snapshot initialGithub)
     let initialRepository = githubRepository initialGithub
+    createdMilestones <- foldM (createMilestone client spec target snapshot initialRepository) Map.empty (Map.toAscList (planMilestoneCreates initialPlan))
+    forM_ (Map.toAscList (planMilestoneChanges initialPlan)) $ \(uuid, desired) -> do
+        guardTarget client spec snapshot target initialRepository
+        let prior = githubMilestoneByUuid initialGithub Map.! uuid
+        current <- getMilestone client target (githubMilestoneNumber prior)
+        verifyManagedMilestone target uuid current
+        when (milestoneDrift desired current) $ do
+            _ <- restSingle client "PATCH" (milestonePath target current) (Just (milestonePayload desired))
+            pure ()
     forM_ (planLabelCreates initialPlan) $ \name -> do
         guardTarget client spec snapshot target initialRepository
         _ <- restSingle client "POST" (repoPath target <> "/labels") (Just (object ["name" .= name, "color" .= ("ededed" :: Text), "description" .= ("Managed by myque-gh." :: Text)]))
@@ -211,6 +307,8 @@ reconcile querySelected client spec target snapshot = withTargetLock target $ do
             observed
                 { githubLabels = mergeLabels createdLabels (githubLabels observed)
                 , githubIssueByUuid = Map.union (githubIssueByUuid observed) created
+                , githubMilestoneByUuid = Map.union (githubMilestoneByUuid observed) createdMilestones
+                , githubMilestones = Map.elems (Map.fromList [(githubMilestoneNumber milestone, milestone) | milestone <- Map.elems createdMilestones <> githubMilestones observed])
                 }
         refreshedWithCreates = withCreates refreshed
     postCreatePlan <- either conflicts pure (buildPlan querySelected target snapshot refreshedWithCreates)
@@ -226,12 +324,81 @@ reconcile querySelected client spec target snapshot = withTargetLock target $ do
         let desiredParent = snd (planParentChanges parentPlan Map.! uuid)
         participants <- refreshParentParticipants client target refreshedFields uuid desiredParent
         applyParentChange client target participants uuid desiredParent
+    membershipObserved <- withCreates <$> discoverGithub client target snapshot
+    membershipPlan <- either conflicts pure (buildPlan querySelected target snapshot membershipObserved)
+    forM_ (Map.toAscList (planMilestoneAssignments membershipPlan)) $ \(uuid, (_, desired)) -> do
+        guardTarget client spec snapshot target initialRepository
+        applyMilestoneAssignment client target membershipObserved uuid desired
     finalObserved <- withCreates <$> discoverGithub client target snapshot
     verified <- traverse (verifyCurrentIssue client target snapshot finalObserved) (Map.toAscList (githubIssueByUuid finalObserved))
-    let finalGithub = finalObserved{githubIssueByUuid = Map.fromList verified}
+    verifiedMilestones <- traverse (verifyCurrentMilestone client target snapshot) (Map.toAscList (githubMilestoneByUuid finalObserved))
+    let finalGithub =
+            finalObserved
+                { githubIssueByUuid = Map.fromList verified
+                , githubMilestoneByUuid = Map.fromList verifiedMilestones
+                , githubMilestones = Map.elems (Map.fromList [(githubMilestoneNumber milestone, milestone) | milestone <- githubMilestones finalObserved <> map snd verifiedMilestones])
+                }
     finalPlan <- either conflicts pure (buildPlan querySelected target snapshot finalGithub)
     unless (planIsEmpty finalPlan) (throwIO Failure{failureCode = 3, failureDiagnostic = "not-converged\n" <> renderPlan target snapshot finalPlan})
     pure initialPlan
+
+milestonePath :: Target -> GithubMilestone -> Text
+milestonePath target milestone = repoPath target <> "/milestones/" <> T.pack (show (githubMilestoneNumber milestone))
+
+milestonePayload :: DesiredMilestone -> Value
+milestonePayload desired =
+    object
+        [ "title" .= desiredMilestoneTitle desired
+        , "description" .= desiredMilestoneDescription desired
+        , "state" .= (if desiredMilestoneState desired == IssueOpen then "open" else "closed" :: Text)
+        ]
+
+createMilestone :: GithubClient -> SourceSpec -> Target -> Snapshot -> RepositoryMeta -> Map.Map Uuid GithubMilestone -> (Uuid, DesiredMilestone) -> IO (Map.Map Uuid GithubMilestone)
+createMilestone client spec target snapshot repository created (uuid, desired) = do
+    guardTarget client spec snapshot target repository
+    (_, value) <- restSingle client "POST" (repoPath target <> "/milestones") (Just (milestonePayload desired))
+    milestone <- either (\message -> throwIO Failure{failureCode = 3, failureDiagnostic = "invalid created milestone response: " <> T.pack message}) pure (parseEither parseMilestone value)
+    verifyManagedMilestone target uuid milestone
+    pure (Map.insert uuid milestone created)
+
+verifyManagedMilestone :: Target -> Uuid -> GithubMilestone -> IO ()
+verifyManagedMilestone target uuid milestone = case managedMilestoneIdentity target milestone of
+    Right (Just actual) | actual == uuid -> pure ()
+    _ -> throwIO Failure{failureCode = 1, failureDiagnostic = "milestone identity changed or creator is untrusted: #" <> T.pack (show (githubMilestoneNumber milestone))}
+
+verifyCurrentMilestone :: GithubClient -> Target -> Snapshot -> (Uuid, GithubMilestone) -> IO (Uuid, GithubMilestone)
+verifyCurrentMilestone client target snapshot (uuid, prior) = case Map.lookup uuid (storeById (snapshotStore snapshot)) of
+    Just item | itemKind item == Milestone -> do
+        current <- getMilestone client target (githubMilestoneNumber prior)
+        verifyManagedMilestone target uuid current
+        let desired = projectMilestone (ProjectionContext snapshot target Map.empty) item
+        when (milestoneDrift desired current) (throwIO Failure{failureCode = 3, failureDiagnostic = "not-converged milestone #" <> T.pack (show (githubMilestoneNumber current))})
+        pure (uuid, current)
+    _ -> pure (uuid, prior)
+
+{- | Refresh both membership and destination identity immediately before writing.
+An intervening human assignment must not be overwritten by a stale plan.
+-}
+applyMilestoneAssignment :: GithubClient -> Target -> GithubSnapshot -> Uuid -> Maybe Uuid -> IO ()
+applyMilestoneAssignment client target github uuid desired = do
+    prior <- maybe (throwIO Failure{failureCode = 1, failureDiagnostic = "cannot assign milestone before issue exists"}) pure (Map.lookup uuid (githubIssueByUuid github))
+    current <- getIssue client target (githubIssueNumber prior)
+    verifyManaged target uuid current
+    refreshedCurrent <- traverse (getMilestone client target . githubMilestoneNumber) (githubIssueMilestone current)
+    let currentWithMilestone = current{githubIssueMilestone = refreshedCurrent}
+    pending <- either conflicts pure (milestoneAssignmentPending target github (Just currentWithMilestone) desired)
+    when pending $ do
+        destination <-
+            traverse
+                ( \milestoneUuid -> do
+                    known <- maybe (throwIO Failure{failureCode = 1, failureDiagnostic = "cannot assign missing milestone " <> uuidText milestoneUuid}) pure (Map.lookup milestoneUuid (githubMilestoneByUuid github))
+                    latest <- getMilestone client target (githubMilestoneNumber known)
+                    verifyManagedMilestone target milestoneUuid latest
+                    pure (githubMilestoneNumber latest)
+                )
+                desired
+        _ <- restSingle client "PATCH" (repoPath target <> "/issues/" <> T.pack (show (githubIssueNumber current))) (Just (object ["milestone" .= destination]))
+        pure ()
 
 verifyCurrentIssue :: GithubClient -> Target -> Snapshot -> GithubSnapshot -> (Uuid, GithubIssue) -> IO (Uuid, GithubIssue)
 verifyCurrentIssue client target snapshot github (uuid, prior) = case Map.lookup uuid (storeById (snapshotStore snapshot)) of

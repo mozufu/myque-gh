@@ -7,6 +7,7 @@ module Myque.Github.Github (
     discoverCore,
     getRepository,
     getIssue,
+    getMilestone,
     getPullRequest,
     restSingle,
     restPaginated,
@@ -14,6 +15,7 @@ module Myque.Github.Github (
     encodePathSegment,
     repoPath,
     parseIssue,
+    parseMilestone,
 ) where
 
 import Control.Exception (IOException, catch, throwIO)
@@ -70,23 +72,27 @@ sanitizeEnvironment environment =
     [("GH_PROMPT_DISABLED", "1"), ("GH_PAGER", "cat"), ("NO_COLOR", "1")]
         <> filter (\(name, _) -> name `notElem` ["GH_PROMPT_DISABLED", "GH_PAGER", "NO_COLOR", "GH_DEBUG"]) environment
 
--- | Discover issues, labels, pull-request links, and optional head facts.
+-- | Discover issues, native milestones, labels, pull-request links, and optional head facts.
 discoverGithub :: GithubClient -> Target -> Snapshot -> IO GithubSnapshot
 discoverGithub client target snapshot = do
     core <- discoverCore client target snapshot
     enrichPullRequestFacts client target core
 
--- | Discover repository, issue, label, and pull-request identity data without optional facts.
+-- | Discover repository, issue, milestone, label, and pull-request identities without optional facts.
 discoverCore :: GithubClient -> Target -> Snapshot -> IO GithubSnapshot
 discoverCore client target snapshot = do
     repository <- getRepository client target
     issuePages <- restPaginated client (repoPath target <> "/issues?state=all&sort=created&direction=asc&per_page=100")
     labelPages <- restPaginated client (repoPath target <> "/labels?per_page=100")
+    milestonePages <- restPaginated client (repoPath target <> "/milestones?state=all&per_page=100")
     prPages <- graphqlPaginated client corePullRequestsQuery target
     issues <- parseIssuePages issuePages
     labels <- parsePages "labels" parseLabel labelPages
+    milestoneRows <- parsePages "milestones" parseMilestone milestonePages
+    let milestones = Map.elems (Map.fromList [(githubMilestoneNumber milestone, milestone) | milestone <- milestoneRows])
     prs <- parsePullRequestPages prPages
     (issueMap, issueWarnings) <- identifyIssues target issues
+    (milestoneMap, milestoneWarnings) <- identifyMilestones target milestones
     let canonical = storeById (snapshotStore snapshot)
         (prMap, prWarnings) = identifyPullRequests canonical target prs
     pure
@@ -96,7 +102,9 @@ discoverCore client target snapshot = do
             , githubLabels = labels
             , githubIssueByUuid = issueMap
             , githubPrsByUuid = prMap
-            , githubWarnings = issueWarnings <> prWarnings
+            , githubWarnings = issueWarnings <> milestoneWarnings <> prWarnings
+            , githubMilestones = milestones
+            , githubMilestoneByUuid = milestoneMap
             }
 
 -- | Read and validate target repository identity and issue availability.
@@ -115,6 +123,12 @@ getIssue :: GithubClient -> Target -> Int -> IO GithubIssue
 getIssue client target number = do
     (_, value) <- restSingle client "GET" (repoPath target <> "/issues/" <> T.pack (show number)) Nothing
     decodeValue "issue" parseIssue value
+
+-- | Read the native milestone fields owned or consulted by reconciliation.
+getMilestone :: GithubClient -> Target -> Int -> IO GithubMilestone
+getMilestone client target number = do
+    (_, value) <- restSingle client "GET" (repoPath target <> "/milestones/" <> T.pack (show number)) Nothing
+    decodeValue "milestone" parseMilestone value
 
 -- | Read a pull-request body and exact base repository name.
 getPullRequest :: GithubClient -> Target -> Int -> IO (Text, Text)
@@ -230,7 +244,21 @@ parseIssue = withObject "issue" $ \row -> do
     issueUrl <- row .:? "html_url"
     parentUrl <- row .:? "parent_issue_url"
     parent <- traverse parseIssueRef parentUrl
-    pure (GithubIssue issueId number nodeId author body title state reason (Set.fromList labels) updatedAt issueUrl parent)
+    milestone <- row .:? "milestone" >>= traverse parseMilestone
+    pure (GithubIssue issueId number nodeId author body title state reason (Set.fromList labels) updatedAt issueUrl parent milestone)
+
+-- | Parse a native milestone. Missing creators cannot establish trusted ownership.
+parseMilestone :: Value -> Parser GithubMilestone
+parseMilestone = withObject "milestone" $ \row -> do
+    creator <- row .:? "creator"
+    author <- maybe (pure "") (withObject "creator" (.: "login")) creator
+    state <- row .: "state" >>= parseIssueState
+    GithubMilestone
+        <$> row .: "number"
+        <*> pure author
+        <*> row .: "title"
+        <*> (row .:? "description" .!= "")
+        <*> pure state
 
 parseIssueRef :: Text -> Parser GithubIssueRef
 parseIssueRef raw = case reverse (T.splitOn "/" raw) of
@@ -276,6 +304,28 @@ identifyIssues target issues = do
     trusted issue = T.toCaseFold (githubIssueAuthor issue) `Set.member` targetIssueAuthors target
     number issue = T.pack (show (githubIssueNumber issue))
     third (_, _, value) = value
+
+{- | A UUID header and trusted creator establish ownership, never a mutable title.
+Repeated pagination rows have already been collapsed by milestone number.
+-}
+identifyMilestones :: Target -> [GithubMilestone] -> IO (Map Uuid GithubMilestone, [Warning])
+identifyMilestones target milestones = do
+    observations <- forM milestones $ \milestone -> case parseMilestoneIdentity (githubMilestoneDescription milestone) of
+        Left (MarkerError message)
+            | trusted milestone -> remoteFailure 1 ("identity-conflict milestone #" <> number milestone <> ": " <> message)
+            | otherwise -> pure (Nothing, Just (untrustedWarning milestone message))
+        Right Nothing -> pure (Nothing, Nothing)
+        Right (Just uuid)
+            | trusted milestone -> pure (Just (uuid, milestone), Nothing)
+            | otherwise -> pure (Nothing, Just (untrustedWarning milestone ("claims " <> T.pack (show uuid))))
+    let grouped = Map.fromListWith (<>) [(uuid, [milestone]) | (Just (uuid, milestone), _) <- observations]
+    case [(uuid, map githubMilestoneNumber rows) | (uuid, rows) <- Map.toList grouped, length rows > 1] of
+        [] -> pure (Map.mapMaybe listToMaybe grouped, mapMaybe snd observations)
+        conflicts -> remoteFailure 1 ("duplicate milestone projection identities: " <> T.intercalate "; " [T.pack (show uuid) <> " in " <> T.pack (show numbers) | (uuid, numbers) <- conflicts])
+  where
+    trusted milestone = not (T.null (githubMilestoneAuthor milestone)) && T.toCaseFold (githubMilestoneAuthor milestone) `Set.member` targetIssueAuthors target
+    number milestone = T.pack (show (githubMilestoneNumber milestone))
+    untrustedWarning milestone detail = Warning{warningCode = "untrusted-identity-claim", warningDetail = "milestone #" <> number milestone <> " by " <> githubMilestoneAuthor milestone <> ": " <> detail}
 
 corePullRequestsQuery :: Text
 corePullRequestsQuery = "query($owner:String!,$name:String!,$endCursor:String){repository(owner:$owner,name:$name){pullRequests(first:100,after:$endCursor,states:[OPEN,CLOSED,MERGED],orderBy:{field:CREATED_AT,direction:ASC}){nodes{number title body state isDraft headRefName headRefOid baseRefName baseRefOid headRepository{nameWithOwner} baseRepository{nameWithOwner} updatedAt}pageInfo{hasNextPage endCursor}}}}"

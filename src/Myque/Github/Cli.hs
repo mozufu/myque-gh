@@ -172,15 +172,15 @@ parseRepo raw = case T.splitOn "/" raw of
     validRepo repo = not (T.null repo) && repo `notElem` [".", ".."] && T.all (\char -> isAlphaNum char || char `elem` ("_.-" :: String)) repo && not (T.any isControl repo)
 
 parserInfo :: ParserInfo Command
-parserInfo = info (helper <*> commandParser) (fullDesc <> header "myque-gh projects canonical myque items into GitHub Issues" <> footer ownership)
+parserInfo = info (helper <*> commandParser) (fullDesc <> header "myque-gh projects canonical myque items into GitHub Issues and milestones" <> footer ownership)
   where
-    ownership = "Canonical myque state owns completion. GitHub comments/reviews remain native facts. Identity lives only in trusted issue headers and PR trailers; removing them loses the association."
+    ownership = "Canonical myque state owns completion. Selected milestone items and required milestone ancestors also create native milestones; issues join their nearest milestone ancestor while keeping sub-issue parents. Done/cancelled milestones close; due dates remain human-owned. Human milestone assignments are preserved unless canonical grouping conflicts, which stops apply. Trusted creators (--issue-author) plus UUID headers identify issues and milestones; removing headers loses the association. GitHub comments/reviews remain native facts, and milestone progress is not completion evidence."
 
 commandParser :: Parser Command
 commandParser =
     hsubparser
         ( command "plan" (info (PlanCommand <$> commonParser False) (progDesc "Read committed canonical state and print GitHub drift without mutation"))
-            <> command "apply" (info (ApplyCommand <$> commonParser True) (progDesc "Converge managed Issue fields with guarded mutations"))
+            <> command "apply" (info (ApplyCommand <$> commonParser True) (progDesc "Converge managed Issues and milestones with guarded mutations"))
             <> command "pr" (info prParser (progDesc "Manage pull request work-item links"))
         )
 
@@ -196,7 +196,7 @@ commonParser applying =
         <*> strOption (long "ref" <> metavar "REF" <> value (if applying then "" else "HEAD") <> showDefault <> help "Committed source ref; apply requires refs/heads/BRANCH")
         <*> optional (strOption (long "source-repo" <> metavar "OWNER/REPO" <> help "Repository used only for canonical hyperlinks"))
         <*> optional (strOption (long "source-branch" <> metavar "BRANCH" <> help "Branch used only for canonical hyperlinks"))
-        <*> strOption (long "project" <> metavar "QUERY" <> value (T.unpack defaultProjectionQuery) <> showDefault <> help "Myque query selecting first-time projections; trusted existing issues and required parents are retained")
+        <*> strOption (long "project" <> metavar "QUERY" <> value (T.unpack defaultProjectionQuery) <> showDefault <> help "Myque query selecting first-time projections; trusted existing issues/milestones and required parents are retained")
 
 prLinkParser :: Parser PrLink
 prLinkParser =

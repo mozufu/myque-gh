@@ -4,6 +4,8 @@
 module Myque.Github.Projection (
     ProjectionContext (..),
     projectIssue,
+    projectMilestone,
+    nearestMilestone,
     managedLabels,
     renderDisplay,
 ) where
@@ -17,12 +19,14 @@ import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Myque.Github.Github (encodePathSegment)
-import Myque.Github.Markers (renderIssueIdentity)
+import Myque.Github.Markers (renderIssueIdentity, renderMilestoneIdentity)
 import Myque.Github.Types
 import Myque.Graph (dependenciesOf, isReady)
 import Myque.Item (
+    Kind (Milestone),
     State (..),
     WorkItem (..),
+    isTerminal,
     itemTitle,
     kindText,
     stateText,
@@ -57,6 +61,37 @@ projectIssue context item linkedPrs =
         Cancelled -> (IssueClosed, Just NotPlanned)
         _ -> (IssueOpen, Nothing)
 
+{- | Keep native grouping separate from the milestone's discussion/parent issue.
+Due dates have no canonical field and are deliberately not projected.
+-}
+projectMilestone :: ProjectionContext -> WorkItem -> DesiredMilestone
+projectMilestone context item =
+    DesiredMilestone
+        { desiredMilestoneUuid = itemId item
+        , desiredMilestoneTitle = itemTitle item
+        , desiredMilestoneDescription =
+            renderMilestoneIdentity (itemId item)
+                <> "Managed by myque. Title, description and state are projected; due date remains human-owned.\n\n"
+                <> "**Canonical:** "
+                <> renderCanonical context item
+                <> "\n\n**Myque state:** "
+                <> stateText (itemState item)
+                <> "\n\nGitHub progress counts closed issues; it is not myque completion evidence.\n"
+                <> itemBody item
+        , desiredMilestoneState = if isTerminal (itemState item) then IssueClosed else IssueOpen
+        }
+
+{- | Native milestones are flat: use the nearest strict milestone ancestor.
+A container's own issue never counts toward its own milestone's progress.
+-}
+nearestMilestone :: Snapshot -> WorkItem -> Maybe Uuid
+nearestMilestone snapshot item = itemParent item >>= ascend
+  where
+    canonical = storeById (snapshotStore snapshot)
+    ascend uuid = do
+        parent <- Map.lookup uuid canonical
+        if itemKind parent == Milestone then Just uuid else itemParent parent >>= ascend
+
 -- | Compute the complete set of labels owned by @myque-gh@.
 managedLabels :: WorkItem -> Set Text
 managedLabels item =
@@ -72,7 +107,7 @@ renderDisplay snapshot item = label (snapshotAbbrev snapshot) item
 renderBody :: ProjectionContext -> WorkItem -> [LinkedPr] -> Text
 renderBody context item linkedPrs =
     renderIssueIdentity (itemId item)
-        <> "Managed by myque. Title, body, myque:* labels and work state are projected; use comments for discussion.\n\n"
+        <> "Managed by myque. Title, body, myque:* labels, work state, parent and canonical milestone grouping are projected; use comments for discussion.\n\n"
         <> "**Myque:** "
         <> markdown display
         <> " — <code>"

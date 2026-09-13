@@ -1,11 +1,13 @@
 {-# LANGUAGE OverloadedStrings #-}
 
--- | Trusted machine markers embedded in issue and pull-request bodies.
+-- | Trusted machine markers embedded in issues, milestones, and pull requests.
 module Myque.Github.Markers (
     MarkerError (..),
     ParsedPrLinks (..),
     parseIssueIdentity,
     renderIssueIdentity,
+    parseMilestoneIdentity,
+    renderMilestoneIdentity,
     parsePrLinks,
     rewritePrLinks,
 ) where
@@ -40,7 +42,7 @@ parseIssueIdentity :: Text -> Either MarkerError (Maybe Uuid)
 parseIssueIdentity body = case normalizedLines body of
     first : second : rest
         | issuePrefix `T.isPrefixOf` first -> do
-            uuid <- parseIssueLine first
+            uuid <- parseIdentityLine "issue" first
             if second /= projectionLine
                 then Left (MarkerError "identity header lacks supported github/v1 projection line")
                 else
@@ -55,11 +57,36 @@ parseIssueIdentity body = case normalizedLines body of
 renderIssueIdentity :: Uuid -> Text
 renderIssueIdentity uuid = issuePrefix <> uuidText uuid <> " -->\n" <> projectionLine <> "\n"
 
-parseIssueLine :: Text -> Either MarkerError Uuid
-parseIssueLine line = do
-    raw <- maybe (Left (MarkerError "malformed myque issue identity")) Right (T.stripSuffix " -->" =<< T.stripPrefix issuePrefix line)
+-- | Native milestones use a distinct projection version, never their mutable title.
+parseMilestoneIdentity :: Text -> Either MarkerError (Maybe Uuid)
+parseMilestoneIdentity body = case normalizedLines body of
+    first : second : rest
+        | issuePrefix `T.isPrefixOf` first -> do
+            uuid <- parseIdentityLine "milestone" first
+            if second /= milestoneProjectionLine
+                then Left (MarkerError "identity header lacks supported github-milestone/v1 projection line")
+                else
+                    if any duplicateMarker rest
+                        then Left (MarkerError "identity header is duplicated")
+                        else Right (Just uuid)
+    first : _
+        | issuePrefix `T.isPrefixOf` first -> Left (MarkerError "identity header is incomplete")
+    _ -> Right Nothing
+  where
+    duplicateMarker line = issuePrefix `T.isPrefixOf` line || "<!-- myque:projection=" `T.isPrefixOf` line
+
+-- | Render the identity header; ownership also requires a trusted creator.
+renderMilestoneIdentity :: Uuid -> Text
+renderMilestoneIdentity uuid = issuePrefix <> uuidText uuid <> " -->\n" <> milestoneProjectionLine <> "\n"
+
+milestoneProjectionLine :: Text
+milestoneProjectionLine = "<!-- myque:projection=github-milestone/v1 -->"
+
+parseIdentityLine :: Text -> Text -> Either MarkerError Uuid
+parseIdentityLine kind line = do
+    raw <- maybe (Left (MarkerError ("malformed myque " <> kind <> " identity"))) Right (T.stripSuffix " -->" =<< T.stripPrefix issuePrefix line)
     uuid <- either (Left . MarkerError . T.pack) Right (parseUuid raw)
-    if isUuidV7 uuid then Right uuid else Left (MarkerError "myque issue identity is not UUIDv7")
+    if isUuidV7 uuid then Right uuid else Left (MarkerError ("myque " <> kind <> " identity is not UUIDv7"))
 
 startMarker :: Text
 startMarker = "<!-- myque:pr-links=github/v1 -->"

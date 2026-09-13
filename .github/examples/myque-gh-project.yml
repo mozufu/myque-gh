@@ -24,10 +24,16 @@ jobs:
       # GITHUB_TOKEN, the owning login for a PAT, or app-slug[bot] for an App.
       # Also include historical creators when adopting myque-gh onto a
       # repository that already contains managed projections; removing them
-      # later does not transfer or recreate those Issues.
+      # later does not transfer or recreate those Issues or milestones.
       issue-authors: |
         github-actions[bot]
       project: kind = task or kind = bug or kind = issue
+      # A kind: milestone ancestor creates a native GitHub milestone;
+      # descendants join their nearest milestone via canonical parent links.
+      # Existing parent Issues/sub-issues remain. Add "or kind = milestone"
+      # to the query to publish non-terminal standalone milestones too.
+      # Titles/descriptions/state are managed; due dates remain human-owned.
+      # Conflicting human milestone assignments stop apply, not overwrite.
       # Optional canonical hyperlink overrides; supply both or omit both.
       # These do not change the checkout branch or target Issue repository.
       # source-repo: OWNER/REPO

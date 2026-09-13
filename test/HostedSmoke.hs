@@ -42,10 +42,13 @@ runSmoke author = withSystemTempDirectory "myque-gh-hosted-smoke" $ \root -> wit
     firstUuid <- newUuidV7
     secondUuid <- newUuidV7
     terminalUuid <- newUuidV7
-    let first = newWorkItem firstUuid Task created "[myque-gh smoke] first"
+    milestoneUuid <- newUuidV7
+    let milestoneTitle = "[myque-gh smoke] release " <> uuidText milestoneUuid
+        milestone = newWorkItem milestoneUuid Milestone created milestoneTitle
+        first = (newWorkItem firstUuid Task created "[myque-gh smoke] first"){itemParent = Just milestoneUuid}
         second = (newWorkItem secondUuid Bug created "[myque-gh smoke] second"){itemParent = Just firstUuid}
         terminal = (newWorkItem terminalUuid Task created "[myque-gh smoke] historical done"){itemState = Done, itemClosed = Just closed}
-    mapM_ (saveItem layout) [first, second, terminal]
+    mapM_ (saveItem layout) [milestone, first, second, terminal]
     _ <- git root ["init", "-q", "--initial-branch=main"]
     _ <- commit root "hosted smoke fixtures"
     firstPlan <- successfulCli root (projectionArgs author "plan" root)
@@ -53,6 +56,13 @@ runSmoke author = withSystemTempDirectory "myque-gh-hosted-smoke" $ \root -> wit
     _ <- successfulCli root (projectionArgs author "apply" root)
     firstIssue <- discoverSmokeIssue firstUuid
     secondIssue <- discoverSmokeIssue secondUuid
+    milestoneIssue <- discoverSmokeIssue milestoneUuid
+    milestoneNumber <- discoverSmokeMilestone milestoneUuid
+    verifyMilestone milestoneNumber milestoneTitle "open"
+    verifyMembership milestoneIssue Nothing
+    verifyMembership firstIssue (Just milestoneNumber)
+    verifyMembership secondIssue (Just milestoneNumber)
+    verifyParent milestoneIssue firstIssue
     terminalIssue <- findSmokeIssue terminalUuid
     unless (terminalIssue == Nothing) (fail "first projection created a terminal-only smoke issue")
     verifyParent firstIssue secondIssue
@@ -64,12 +74,37 @@ runSmoke author = withSystemTempDirectory "myque-gh-hosted-smoke" $ \root -> wit
     noDrift <- successfulCliWithCache freshCache root (projectionArgs author "plan" root)
     unless ("No changes." `isInfixOf` noDrift) (fail ("fresh-cache hosted projection did not converge:\n" <> noDrift))
     verifyHumanFacts firstIssue
-    mapM_ (saveItem layout) [cancel closed first, (cancel closed second){itemParent = Nothing}, terminal]
+    let renamedTitle = milestoneTitle <> " renamed"
+        renamed = milestone{itemBody = "# " <> renamedTitle <> "\n"}
+    _ <- saveItem layout renamed
+    _ <- commit root "rename hosted smoke milestone"
+    _ <- successfulCli root (projectionArgs author "apply" root)
+    renamedNumber <- discoverSmokeMilestone milestoneUuid
+    unless (renamedNumber == milestoneNumber) (fail "milestone rename created a different native number")
+    verifyMilestone milestoneNumber renamedTitle "open"
+    verifyMembership firstIssue (Just milestoneNumber)
+    verifyMembership secondIssue (Just milestoneNumber)
+    mapM_
+        (saveItem layout)
+        [ renamed{itemState = Done, itemClosed = Just closed, itemUpdated = Just closed}
+        , (cancel closed first){itemParent = Nothing}
+        , (cancel closed second){itemParent = Nothing}
+        , terminal
+        ]
     _ <- commit root "cancel hosted smoke fixtures"
     _ <- successfulCli root (projectionArgs author "apply" root)
     verifyCancelled firstIssue
     verifyCancelled secondIssue
     verifyNoParent secondIssue
+    verifyNoParent firstIssue
+    verifyMembership firstIssue Nothing
+    verifyMembership secondIssue Nothing
+    verifyMilestone milestoneNumber renamedTitle "closed"
+    verifyHumanFacts firstIssue
+    withSystemTempDirectory "myque-gh-final-empty-cache" $ \finalCache -> do
+        finalPlan <- successfulCliWithCache finalCache root (projectionArgs author "plan" root)
+        unless ("No changes." `isInfixOf` finalPlan) (fail ("closed/detached milestone projection did not converge:\n" <> finalPlan))
+    putStrLn (T.unpack (uuidText milestoneUuid) <> " -> https://github.com/" <> repo <> "/milestone/" <> show milestoneNumber)
     putStrLn (T.unpack (uuidText firstUuid) <> " -> https://github.com/" <> repo <> "/issues/" <> show firstIssue)
     putStrLn (T.unpack (uuidText secondUuid) <> " -> https://github.com/" <> repo <> "/issues/" <> show secondIssue)
 
@@ -142,6 +177,26 @@ discoverSmokeIssue value = do
     case found of
         Just number -> pure number
         Nothing -> fail ("created issue not found for " <> T.unpack (uuidText value))
+
+discoverSmokeMilestone :: Uuid -> IO Int
+discoverSmokeMilestone value = do
+    rows <- gh ["api", "--hostname", "github.com", "--paginate", "/repos/" <> repo <> "/milestones?state=all&per_page=100", "--jq", query]
+    case filter (not . null) (lines rows) of
+        [row] | Just number <- readMaybe row -> pure number
+        _ -> fail ("expected exactly one native milestone for " <> T.unpack (uuidText value))
+  where
+    marker = "<!-- myque:id=" <> T.unpack (uuidText value) <> " -->"
+    query = ".[] | select(((.description // \"\") | split(\"\\n\")[0]) == \"" <> marker <> "\") | .number"
+
+verifyMembership :: Int -> Maybe Int -> IO ()
+verifyMembership issue expected = do
+    actual <- gh ["api", "--hostname", "github.com", "/repos/" <> repo <> "/issues/" <> show issue, "--jq", ".milestone.number // \"none\""]
+    unless (trim actual == maybe "none" show expected) (fail ("unexpected native milestone membership on issue #" <> show issue))
+
+verifyMilestone :: Int -> Text -> String -> IO ()
+verifyMilestone number title expectedState = do
+    actual <- gh ["api", "--hostname", "github.com", "/repos/" <> repo <> "/milestones/" <> show number, "--jq", "[.title,.state] | @tsv"]
+    unless (trim actual == T.unpack title <> "\t" <> expectedState) (fail "native milestone title/state did not converge")
 
 ensureHumanLabel :: IO ()
 ensureHumanLabel = do

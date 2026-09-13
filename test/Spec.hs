@@ -16,7 +16,7 @@ import Data.Text qualified as T
 import Myque.Github.Cli (runCli)
 import Myque.Github.Github (discoverGithub, encodePathSegment, getRepository, graphqlPaginated, restSingle)
 import Myque.Github.Markers
-import Myque.Github.Projection (ProjectionContext (..), projectIssue, renderDisplay)
+import Myque.Github.Projection (ProjectionContext (..), projectIssue, projectMilestone, renderDisplay)
 import Myque.Github.Reconcile (applyIssueDiff, applyParentChange, buildPlan, defaultProjectionQuery, diffIssue, planIsEmpty, reconcile, selectProjection)
 import Myque.Github.Source (decodeBlobBatch, withSnapshot)
 import Myque.Github.Types
@@ -116,7 +116,7 @@ main = hspec $ do
         it "preserves human labels while replacing managed labels" $ do
             value <- fixtureUuid
             let desired = DesiredIssue value "A" "title" "body" IssueOpen Nothing (Set.fromList ["myque:state:open"])
-                actual = GithubIssue 1 1 "N" "bot" "body" "title" IssueOpen Nothing (Set.fromList ["human", "myque:state:done"]) "now" Nothing Nothing
+                actual = GithubIssue 1 1 "N" "bot" "body" "title" IssueOpen Nothing (Set.fromList ["human", "myque:state:done"]) "now" Nothing Nothing Nothing
             diffIssue desired actual `shouldBe` [RemoveLabel "myque:state:done", AddLabel "myque:state:open"]
     describe "projection planning" $ do
         it "uses the conservative default and retains trusted projections" $ do
@@ -215,7 +215,7 @@ main = hspec $ do
         it "encodes Unicode managed-label deletion endpoints" $ do
             value <- fixtureUuid
             let desired = DesiredIssue value "A" "title" "body" IssueOpen Nothing Set.empty
-                actual = GithubIssue 1 1 "N" "bot" "body" "title" IssueOpen Nothing (Set.singleton "myque:tag:硬體") "now" Nothing Nothing
+                actual = GithubIssue 1 1 "N" "bot" "body" "title" IssueOpen Nothing (Set.singleton "myque:tag:硬體") "now" Nothing Nothing Nothing
                 client = scriptedClient $ \_ args _ -> do
                     args `shouldSatisfy` elem "/repos/owner/repo/issues/1/labels/myque%3Atag%3A%E7%A1%AC%E9%AB%94"
                     pure (okIncluded Null)
@@ -228,6 +228,140 @@ main = hspec $ do
                 linked = snapshot{snapshotSource = source, snapshotSourcePaths = Map.singleton value ".tasks/硬體 設計.md"}
                 desired = projectIssue (ProjectionContext linked fixtureTarget Map.empty) item []
             desiredBody desired `shouldSatisfy` T.isInfixOf "https://github.com/%E6%93%81%E6%9C%89%E8%80%85/%E5%B0%88%E6%A1%88/blob/%E5%8A%9F%E8%83%BD%2F%E7%A1%AC%E9%AB%94/.tasks/%E7%A1%AC%E9%AB%94%20%E8%A8%AD%E8%A8%88.md"
+    describe "native milestone planning" $ do
+        it "assigns through an epic without replacing the issue parent chain" $ do
+            snapshot <- milestoneChain Epic
+            outer <- fixtureUuid
+            middle <- otherUuid
+            child <- thirdUuid
+            plan <- requireRight (buildPlan (Set.singleton child) fixtureTarget snapshot (fixtureGithub Map.empty []))
+            Map.keys (planIssueCreates plan) `shouldMatchList` [outer, middle, child]
+            Map.keys (planMilestoneCreates plan) `shouldBe` [outer]
+            fmap snd (planParentChanges plan) `shouldBe` Map.fromList [(middle, Just outer), (child, Just middle)]
+            fmap snd (planMilestoneAssignments plan) `shouldBe` Map.fromList [(middle, Just outer), (child, Just outer)]
+        it "uses the nearest nested milestone and never assigns a container to itself" $ do
+            snapshot <- milestoneChain Milestone
+            outer <- fixtureUuid
+            middle <- otherUuid
+            child <- thirdUuid
+            plan <- requireRight (buildPlan (Set.singleton child) fixtureTarget snapshot (fixtureGithub Map.empty []))
+            Map.keys (planMilestoneCreates plan) `shouldMatchList` [outer, middle]
+            fmap snd (planMilestoneAssignments plan) `shouldBe` Map.fromList [(middle, Just outer), (child, Just middle)]
+        it "renames a retained UUID instead of creating another native milestone" $ do
+            snapshot <- fixtureSnapshotWithParentKinds
+            parent <- fixtureUuid
+            let old = managedMilestone 41 parent "old title" IssueOpen
+                github = withMilestones [(parent, old)] (fixtureGithub Map.empty [])
+            plan <- requireRight (buildPlan Set.empty fixtureTarget snapshot github)
+            planMilestoneCreates plan `shouldBe` Map.empty
+            fmap desiredMilestoneTitle (Map.lookup parent (planMilestoneChanges plan)) `shouldBe` Just "roadmap container"
+        it "closes retained done and cancelled native milestones" $ do
+            snapshot <- fixtureSnapshotWithParentKinds
+            parent <- fixtureUuid
+            let old = managedMilestone 41 parent "roadmap container" IssueOpen
+                github = withMilestones [(parent, old)] (fixtureGithub Map.empty [])
+            mapM_
+                ( \state -> do
+                    let terminal = adjustSnapshotItem parent (\item -> item{itemState = state}) snapshot
+                    plan <- requireRight (buildPlan Set.empty fixtureTarget terminal github)
+                    fmap desiredMilestoneState (Map.lookup parent (planMilestoneChanges plan)) `shouldBe` Just IssueClosed
+                )
+                [Done, Cancelled]
+        it "moves managed membership by UUID and clears it after detachment" $ do
+            snapshot <- milestoneChain Milestone
+            outer <- fixtureUuid
+            middle <- otherUuid
+            child <- thirdUuid
+            let old = managedMilestone 41 outer "outer" IssueOpen
+                nearest = managedMilestone 42 middle "middle" IssueOpen
+                issue = (blankIssue 8 child){githubIssueMilestone = Just old}
+                github = withMilestones [(outer, old), (middle, nearest)] (fixtureGithub (Map.singleton child issue) [])
+            move <- requireRight (buildPlan (Set.singleton child) fixtureTarget snapshot github)
+            fmap snd (Map.lookup child (planMilestoneAssignments move)) `shouldBe` Just (Just middle)
+            clear <- requireRight (buildPlan (Set.singleton child) fixtureTarget (snapshotWithoutParent snapshot child) github)
+            fmap snd (Map.lookup child (planMilestoneAssignments clear)) `shouldBe` Just Nothing
+        it "leaves a kind-changed native orphan untouched while clearing its membership" $ do
+            snapshot <- fixtureSnapshotWithParentKinds
+            parent <- fixtureUuid
+            child <- otherUuid
+            let native = managedMilestone 41 parent "roadmap container" IssueOpen
+                issue = (blankIssue 8 child){githubIssueMilestone = Just native}
+                github = withMilestones [(parent, native)] (fixtureGithub (Map.singleton child issue) [])
+                changed = adjustSnapshotItem parent (\item -> item{itemKind = Epic}) snapshot
+            plan <- requireRight (buildPlan (Set.singleton child) fixtureTarget changed github)
+            planMilestoneCreates plan `shouldBe` Map.empty
+            planMilestoneChanges plan `shouldBe` Map.empty
+            fmap snd (Map.lookup child (planMilestoneAssignments plan)) `shouldBe` Just Nothing
+            planWarnings plan `shouldSatisfy` any (T.isInfixOf "41" . warningDetail)
+        it "preserves manual membership unless a canonical milestone would replace it" $ do
+            snapshot <- fixtureSnapshotWithParentKinds
+            child <- otherUuid
+            let manual = GithubMilestone 99 "human" "manual" "Human description" IssueOpen
+                issue = (blankIssue 8 child){githubIssueMilestone = Just manual}
+                github = (fixtureGithub (Map.singleton child issue) []){githubMilestones = [manual]}
+            detached <- requireRight (buildPlan (Set.singleton child) fixtureTarget (snapshotWithoutParent snapshot child) github)
+            Map.lookup child (planMilestoneAssignments detached) `shouldBe` Nothing
+            buildPlan (Set.singleton child) fixtureTarget snapshot github `shouldSatisfy` isLeft
+        it "refuses a native title collision rather than adopting an unrelated milestone" $ do
+            snapshot <- fixtureSnapshotWithParentKinds
+            child <- otherUuid
+            let manual = GithubMilestone 99 "human" "roadmap container" "Human description" IssueOpen
+                github = (fixtureGithub Map.empty []){githubMilestones = [manual]}
+            buildPlan (Set.singleton child) fixtureTarget snapshot github `shouldSatisfy` isLeft
+        it "refuses two canonical milestones with the same native title" $ do
+            snapshot <- milestoneChain Milestone
+            outer <- fixtureUuid
+            middle <- otherUuid
+            child <- thirdUuid
+            let outerBody = itemBody (storeById (snapshotStore snapshot) Map.! outer)
+                colliding = adjustSnapshotItem middle (\item -> item{itemBody = outerBody}) snapshot
+            buildPlan (Set.singleton child) fixtureTarget colliding (fixtureGithub Map.empty []) `shouldSatisfy` isLeft
+    describe "native milestone discovery" $ do
+        it "discovers closed trusted identities and nested issue membership" $ do
+            snapshot <- fixtureSnapshot
+            value <- fixtureUuid
+            let milestone = managedMilestone 41 value "released" IssueClosed
+                issue = (blankIssue 8 value){githubIssueMilestone = Just milestone}
+            github <- discoverGithub (discoveryClientWithMilestones [issue] [milestone] [] emptyPullRequests) fixtureTarget snapshot
+            Map.lookup value (githubMilestoneByUuid github) `shouldBe` Just milestone
+            fmap githubIssueMilestone (Map.lookup value (githubIssueByUuid github)) `shouldBe` Just (Just milestone)
+        it "rejects duplicate trusted native identities" $ do
+            snapshot <- fixtureSnapshot
+            value <- fixtureUuid
+            let first = managedMilestone 41 value "first" IssueOpen
+                second = managedMilestone 42 value "second" IssueClosed
+            result <- try (discoverGithub (discoveryClientWithMilestones [] [first, second] [] emptyPullRequests) fixtureTarget snapshot)
+            result `shouldSatisfy` (isLeft :: Either Failure GithubSnapshot -> Bool)
+        it "rejects incomplete and duplicate trusted milestone headers" $ do
+            snapshot <- fixtureSnapshot
+            value <- fixtureUuid
+            let milestone = managedMilestone 41 value "release" IssueOpen
+                headers = ["<!-- myque:id=" <> T.pack (show value) <> " -->\n", renderMilestoneIdentity value <> renderMilestoneIdentity value]
+            mapM_
+                ( \header -> do
+                    result <- try (discoverGithub (discoveryClientWithMilestones [] [milestone{githubMilestoneDescription = header}] [] emptyPullRequests) fixtureTarget snapshot)
+                    result `shouldSatisfy` (isLeft :: Either Failure GithubSnapshot -> Bool)
+                )
+                headers
+        it "warns about untrusted claims without owning them or poisoning a trusted identity" $ do
+            snapshot <- fixtureSnapshot
+            value <- fixtureUuid
+            let trusted = managedMilestone 41 value "release" IssueOpen
+                impostor = trusted{githubMilestoneNumber = 42, githubMilestoneAuthor = "human"}
+            github <- discoverGithub (discoveryClientWithMilestones [] [trusted, impostor] [] emptyPullRequests) fixtureTarget snapshot
+            Map.lookup value (githubMilestoneByUuid github) `shouldBe` Just trusted
+            githubWarnings github `shouldSatisfy` any (T.isInfixOf "42" . warningDetail)
+        it "warns rather than failing on malformed untrusted claims" $ do
+            snapshot <- fixtureSnapshot
+            value <- fixtureUuid
+            let impostor =
+                    (managedMilestone 42 value "release" IssueOpen)
+                        { githubMilestoneAuthor = "human"
+                        , githubMilestoneDescription = "<!-- myque:id=" <> T.pack (show value) <> " -->\n"
+                        }
+            github <- discoverGithub (discoveryClientWithMilestones [] [impostor] [] emptyPullRequests) fixtureTarget snapshot
+            githubMilestoneByUuid github `shouldBe` Map.empty
+            githubWarnings github `shouldSatisfy` any (T.isInfixOf "42" . warningDetail)
     describe "GitHub transport" $ do
         it "sends JSON writes through stdin and parses included responses" $ do
             let client = scriptedClient $ \_ args input -> do
@@ -306,6 +440,19 @@ main = hspec $ do
             failureCodeOf result `shouldBe` Just 1
             calls <- readIORef journal
             filter (any (isInfixOfArg "/sub_issues")) calls `shouldBe` []
+        it "preserves an intervening human milestone assignment" $ withParentWriterSnapshot $ \spec original -> do
+            (snapshot, client, writes) <- milestoneWriterFixture original True
+            selected <- defaultSelection snapshot
+            result <- try (reconcile selected client spec fixtureTarget snapshot)
+            failureCodeOf result `shouldBe` Just 1
+            readIORef writes `shouldReturn` []
+        it "rejects success when GitHub silently ignores milestone assignment" $ withParentWriterSnapshot $ \spec original -> do
+            (snapshot, client, writes) <- milestoneWriterFixture original False
+            selected <- defaultSelection snapshot
+            result <- try (reconcile selected client spec fixtureTarget snapshot)
+            failureCodeOf result `shouldBe` Just 3
+            calls <- readIORef writes
+            length calls `shouldBe` 1
         it "stops before mutation when the source ref moves" $ withWriterSnapshot $ \spec snapshot -> do
             journal <- newIORef []
             moved <- newIORef False
@@ -395,10 +542,10 @@ fixtureTarget :: Target
 fixtureTarget = Target "owner" "repo" (Set.singleton "bot")
 
 fixtureGithub :: Map.Map Uuid GithubIssue -> [GithubLabel] -> GithubSnapshot
-fixtureGithub issues labels = GithubSnapshot (RepositoryMeta 1 "owner/repo" False True) (Map.elems issues) labels issues Map.empty []
+fixtureGithub issues labels = GithubSnapshot (RepositoryMeta 1 "owner/repo" False True) (Map.elems issues) labels issues Map.empty [] [] Map.empty
 
 fixtureIssue :: Int -> Uuid -> WorkItem -> GithubIssue
-fixtureIssue number value item = GithubIssue (fromIntegral number) number ("node" <> T.pack (show number)) "bot" (renderIssueIdentity value <> itemBody item) (itemTitleText item) IssueOpen Nothing Set.empty "now" Nothing Nothing
+fixtureIssue number value item = GithubIssue (fromIntegral number) number ("node" <> T.pack (show number)) "bot" (renderIssueIdentity value <> itemBody item) (itemTitleText item) IssueOpen Nothing Set.empty "now" Nothing Nothing Nothing
 
 itemTitleText :: WorkItem -> Text
 itemTitleText item = case T.lines (itemBody item) of
@@ -439,6 +586,40 @@ makeKindSnapshot firstKind secondKind = withSystemTempDirectory "myque-gh-kind-f
     gitEnv root ["commit", "-m", "fixture"]
     withSnapshot (SourceSpec root "HEAD" Nothing Nothing Nothing) pure
 
+-- The list shows no membership; the single-issue read can expose a human race.
+-- Writes succeed without applying membership, as GitHub can do for weak tokens.
+milestoneWriterFixture :: Snapshot -> Bool -> IO (Snapshot, GithubClient, IORef [[String]])
+milestoneWriterFixture original humanRace = do
+    parent <- fixtureUuid
+    child <- otherUuid
+    writes <- newIORef []
+    let snapshot = adjustSnapshotItem parent (\item -> item{itemKind = Milestone}) original
+        items = storeById (snapshotStore snapshot)
+        projection = ProjectionContext snapshot fixtureTarget (Map.fromList [(parent, 7), (child, 8)])
+        desired = projectMilestone projection (items Map.! parent)
+        milestone = GithubMilestone 41 "bot" (desiredMilestoneTitle desired) (desiredMilestoneDescription desired) (desiredMilestoneState desired)
+        parentIssue = issueFromDesired 7 (projectIssue projection (items Map.! parent) [])
+        childIssue = (issueFromDesired 8 (projectIssue projection (items Map.! child) [])){githubIssueParent = Just (GithubIssueRef "owner" "repo" 7)}
+        actualChild = if humanRace then childIssue{githubIssueMilestone = Just (GithubMilestone 99 "human" "human release" "" IssueOpen)} else childIssue
+        labels = Set.toAscList (githubIssueLabels parentIssue `Set.union` githubIssueLabels childIssue)
+        client = scriptedClient $ \_ args _ ->
+            if isWriteCall args
+                then do
+                    modifyIORef' writes (<> [args])
+                    pure (okIncluded (issueValue actualChild))
+                else
+                    pure $
+                        if any (isInfixOfArg "/milestones?") args
+                            then jsonResult (Array (pure (milestoneValue milestone)))
+                            else
+                                if "/repos/owner/repo/milestones/41" `elem` args
+                                    then okIncluded (milestoneValue milestone)
+                                    else
+                                        if "/repos/owner/repo/milestones/99" `elem` args
+                                            then maybe (okIncluded Null) (okIncluded . milestoneValue) (githubIssueMilestone actualChild)
+                                            else parentWriterResponse [parentIssue, childIssue] labels actualChild args
+    pure (snapshot, client, writes)
+
 selectionFor :: Text -> Snapshot -> IO (Set.Set Uuid)
 selectionFor expression snapshot = do
     query <- either fail pure (parseQuery expression)
@@ -448,7 +629,7 @@ defaultSelection :: Snapshot -> IO (Set.Set Uuid)
 defaultSelection = selectionFor defaultProjectionQuery
 
 blankIssue :: Int -> Uuid -> GithubIssue
-blankIssue number value = GithubIssue (fromIntegral number) number ("node" <> T.pack (show number)) "bot" (renderIssueIdentity value) "" IssueOpen Nothing Set.empty "now" Nothing Nothing
+blankIssue number value = GithubIssue (fromIntegral number) number ("node" <> T.pack (show number)) "bot" (renderIssueIdentity value) "" IssueOpen Nothing Set.empty "now" Nothing Nothing Nothing
 
 snapshotWithoutParent :: Snapshot -> Uuid -> Snapshot
 snapshotWithoutParent snapshot uuid = snapshot{snapshotStore = store{storeById = Map.adjust (\item -> item{itemParent = Nothing}) uuid (storeById store)}}
@@ -486,6 +667,7 @@ writerResponse view args
     | isRepositoryGet args = okIncluded (repositoryWithId repositoryIdentity)
     | any (isInfixOfArg "/issues?state=all") args = jsonResult (Array (maybe mempty (pure . issueValue) visibleIssue))
     | any (isInfixOfArg "/labels?") args = jsonResult (Array (foldMap (foldMap (pure . labelValue) . Set.toAscList . githubIssueLabels) visibleIssue))
+    | any (isInfixOfArg "/milestones?state=all") args = jsonResult (Array mempty)
     | "graphql" `elem` args = jsonResult emptyPullRequests
     | any (isInfixOfArg "/issues/7") args = maybe unexpected (okIncluded . issueValue) visibleIssue
     | otherwise = unexpected
@@ -519,6 +701,7 @@ issueValue issue =
         , "updated_at" .= githubIssueUpdatedAt issue
         , "html_url" .= githubIssueUrl issue
         , "parent_issue_url" .= fmap issueRefUrl (githubIssueParent issue)
+        , "milestone" .= fmap milestoneValue (githubIssueMilestone issue)
         ]
 
 issueRefUrl :: GithubIssueRef -> Text
@@ -549,6 +732,7 @@ issueFromDesired number desired =
         (desiredLabels desired)
         "now"
         (Just ("https://github.com/owner/repo/issues/" <> T.pack (show number)))
+        Nothing
         Nothing
 
 withWriterSnapshot :: (SourceSpec -> Snapshot -> IO a) -> IO a
@@ -585,6 +769,7 @@ laggingResponse issue args
     | isRepositoryGet args = okIncluded repositoryValue
     | any (isInfixOfArg "/issues?state=all") args = jsonResult (Array mempty)
     | any (isInfixOfArg "/labels?") args = jsonResult (Array mempty)
+    | any (isInfixOfArg "/milestones?state=all") args = jsonResult (Array mempty)
     | "graphql" `elem` args = jsonResult emptyPullRequests
     | isWriteCall args && any (isInfixOfArg "/labels") args = okIncluded Null
     | isWriteCall args && any (isInfixOfArg "/issues") args = okIncluded (issueValue issue)
@@ -596,6 +781,7 @@ parentWriterResponse issues labels tamperedChild args
     | isRepositoryGet args = okIncluded repositoryValue
     | any (isInfixOfArg "/issues?state=all") args = jsonResult (Array (foldMap (pure . issueValue) issues))
     | any (isInfixOfArg "/labels?") args = jsonResult (Array (foldMap (pure . labelValue) labels))
+    | any (isInfixOfArg "/milestones?state=all") args = jsonResult (Array mempty)
     | "graphql" `elem` args = jsonResult emptyPullRequests
     | any (isInfixOfArg "/issues/8") args = okIncluded (issueValue tamperedChild)
     | any (isInfixOfArg "/issues/7") args = maybe unexpected (okIncluded . issueValue) (lookupNumber 7)
@@ -639,13 +825,56 @@ discoveryClient :: [Value] -> Value -> GithubClient
 discoveryClient = discoveryClientWithIssues []
 
 discoveryClientWithIssues :: [GithubIssue] -> [Value] -> Value -> GithubClient
-discoveryClientWithIssues issues prs facts = scriptedClient $ \_ args _ -> pure $ case args of
+discoveryClientWithIssues issues = discoveryClientWithMilestones issues []
+
+discoveryClientWithMilestones :: [GithubIssue] -> [GithubMilestone] -> [Value] -> Value -> GithubClient
+discoveryClientWithMilestones issues milestones prs facts = scriptedClient $ \_ args _ -> pure $ case args of
     _ | "--include" `elem` args && "/repos/owner/repo" `elem` args -> okIncluded repositoryValue
     _ | any (isInfixOfArg "/issues?") args -> jsonResult (Array (foldMap (pure . issueValue) issues))
     _ | any (isInfixOfArg "/labels?") args -> jsonResult (Array mempty)
+    _ | any (isInfixOfArg "/milestones?state=all") args -> jsonResult (Array (foldMap (pure . milestoneValue) milestones))
     _ | "graphql" `elem` args && any (isInfixOfArg "statusCheckRollup") args -> jsonResult facts
     _ | "graphql" `elem` args -> jsonResult (object ["data" .= object ["repository" .= object ["pullRequests" .= object ["nodes" .= prs, "pageInfo" .= object ["hasNextPage" .= False, "endCursor" .= Null]]]]])
     _ -> CommandResult (ExitFailure 1) "" "unexpected fake gh call"
+
+milestoneValue :: GithubMilestone -> Value
+milestoneValue milestone =
+    object
+        [ "number" .= githubMilestoneNumber milestone
+        , "creator" .= object ["login" .= githubMilestoneAuthor milestone]
+        , "title" .= githubMilestoneTitle milestone
+        , "description" .= githubMilestoneDescription milestone
+        , "state" .= issueStateValue (githubMilestoneState milestone)
+        ]
+
+managedMilestone :: Int -> Uuid -> Text -> IssueState -> GithubMilestone
+managedMilestone number value title = GithubMilestone number "bot" title (renderMilestoneIdentity value)
+
+withMilestones :: [(Uuid, GithubMilestone)] -> GithubSnapshot -> GithubSnapshot
+withMilestones milestones github = github{githubMilestones = map snd milestones, githubMilestoneByUuid = Map.fromList milestones}
+
+adjustSnapshotItem :: Uuid -> (WorkItem -> WorkItem) -> Snapshot -> Snapshot
+adjustSnapshotItem value change snapshot = snapshot{snapshotStore = store{storeById = Map.adjust change value (storeById store)}}
+  where
+    store = snapshotStore snapshot
+
+milestoneChain :: Kind -> IO Snapshot
+milestoneChain middleKind = withSystemTempDirectory "myque-gh-milestone-chain" $ \root -> do
+    layout <- initLayout root
+    created <- either fail pure (parseTimestamp "2026-08-20T06:21:00Z")
+    outer <- fixtureUuid
+    middle <- otherUuid
+    child <- thirdUuid
+    mapM_
+        (saveItem layout)
+        [ newWorkItem outer Milestone created "outer"
+        , (newWorkItem middle middleKind created "middle"){itemParent = Just outer}
+        , (newWorkItem child Task created "child"){itemParent = Just middle}
+        ]
+    git root ["init", "-q"]
+    git root ["add", "."]
+    gitEnv root ["commit", "-m", "fixture"]
+    withSnapshot (SourceSpec root "HEAD" Nothing Nothing Nothing) pure
 
 jsonResult :: Value -> CommandResult
 jsonResult value = CommandResult ExitSuccess (BL.toStrict (encode [value])) ""

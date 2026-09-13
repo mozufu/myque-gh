@@ -12,6 +12,8 @@ module Myque.Github.Types (
     GithubLabel (..),
     GithubIssueRef (..),
     GithubIssue (..),
+    GithubMilestone (..),
+    DesiredMilestone (..),
     RepositoryMeta (..),
     PrLifecycle (..),
     CiState (..),
@@ -95,6 +97,25 @@ data GithubLabel = GithubLabel
     }
     deriving (Eq, Show)
 
+-- | Native repository milestone; due dates remain human-owned.
+data GithubMilestone = GithubMilestone
+    { githubMilestoneNumber :: Int
+    , githubMilestoneAuthor :: Text
+    , githubMilestoneTitle :: Text
+    , githubMilestoneDescription :: Text
+    , githubMilestoneState :: IssueState
+    }
+    deriving (Eq, Show)
+
+-- | Fields owned by a canonical milestone projection.
+data DesiredMilestone = DesiredMilestone
+    { desiredMilestoneUuid :: Uuid
+    , desiredMilestoneTitle :: Text
+    , desiredMilestoneDescription :: Text
+    , desiredMilestoneState :: IssueState
+    }
+    deriving (Eq, Show)
+
 -- | Stable coordinates for an issue that may live in another repository.
 data GithubIssueRef = GithubIssueRef
     { githubIssueRefOwner :: Text
@@ -117,6 +138,7 @@ data GithubIssue = GithubIssue
     , githubIssueUpdatedAt :: Text
     , githubIssueUrl :: Maybe Text
     , githubIssueParent :: Maybe GithubIssueRef
+    , githubIssueMilestone :: Maybe GithubMilestone
     }
     deriving (Eq, Show)
 
@@ -165,6 +187,8 @@ data GithubSnapshot = GithubSnapshot
     , githubIssueByUuid :: Map Uuid GithubIssue
     , githubPrsByUuid :: Map Uuid [LinkedPr]
     , githubWarnings :: [Warning]
+    , githubMilestones :: [GithubMilestone]
+    , githubMilestoneByUuid :: Map Uuid GithubMilestone
     }
     deriving (Eq, Show)
 
@@ -210,6 +234,9 @@ data Plan = Plan
     , planIssueChanges :: Map Int (Uuid, Text, [IssueChange])
     , planParentChanges :: Map Uuid (Text, Maybe Uuid)
     , planWarnings :: [Warning]
+    , planMilestoneCreates :: Map Uuid DesiredMilestone
+    , planMilestoneChanges :: Map Uuid DesiredMilestone
+    , planMilestoneAssignments :: Map Uuid (Text, Maybe Uuid)
     }
     deriving (Eq, Show)
 
