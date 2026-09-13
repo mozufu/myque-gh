@@ -1,0 +1,25 @@
+name: Reconcile myque projection
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .tasks/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+  checks: read
+
+jobs:
+  reconcile:
+    uses: ./.github/workflows/reconcile.yml
+    with:
+      branch: main
+      myque-gh-ref: main
+      project: kind = task or kind = bug or kind = issue
+    secrets:
+      token: ${{ secrets.GITHUB_TOKEN }}

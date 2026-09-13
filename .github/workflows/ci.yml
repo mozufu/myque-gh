@@ -38,8 +38,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: nixbuild/nix-quick-install-action@v35
-      - run: nix run path:.#myque-gh-hosted-smoke -- --repo mozufu/myque-gh --allow-write
+      # MYQUE_GH_SMOKE_TOKEN must grant Issues write access to mozufu/myque-gh-smoke.
+      - run: nix run path:.#myque-gh-hosted-smoke -- --repo mozufu/myque-gh-smoke --allow-write
         env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: mozufu/myque-gh
+          GH_TOKEN: ${{ secrets.MYQUE_GH_SMOKE_TOKEN }}
+          GH_REPO: mozufu/myque-gh-smoke
           MYQUE_GH_ISSUE_AUTHOR: github-actions[bot]

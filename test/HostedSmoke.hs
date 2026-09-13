@@ -18,13 +18,13 @@ import System.Process (CreateProcess (..), proc, readCreateProcessWithExitCode)
 import Text.Read (readMaybe)
 
 repo :: String
-repo = "mozufu/myque-gh"
+repo = "mozufu/myque-gh-smoke"
 
 main :: IO ()
 main = do
     arguments <- getArgs
     unless (arguments == ["--repo", repo, "--allow-write"]) $ do
-        putStrLn "refusing hosted mutations: require --repo mozufu/myque-gh --allow-write"
+        putStrLn "refusing hosted mutations: require --repo mozufu/myque-gh-smoke --allow-write"
         exitFailure
     author <- maybe "iceice666" id <$> lookupEnv "MYQUE_GH_ISSUE_AUTHOR"
     outcome <- try (runSmoke author)
@@ -84,6 +84,8 @@ projectionArgs author command root =
     , "refs/heads/main"
     , "--issue-author"
     , author
+    , "--project"
+    , "kind = task or kind = bug or kind = issue"
     ]
 
 cancel :: Timestamp -> WorkItem -> WorkItem

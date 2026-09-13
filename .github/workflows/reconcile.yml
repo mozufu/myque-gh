@@ -1,0 +1,67 @@
+name: Reconcile canonical myque items
+
+on:
+  workflow_call:
+    inputs:
+      branch:
+        description: Canonical branch name.
+        required: true
+        type: string
+      project:
+        description: Myque query selecting first-time projections.
+        required: true
+        type: string
+      myque-gh-ref:
+        description: myque-gh Git ref to install.
+        required: true
+        type: string
+      store:
+        description: Canonical repository root relative to the workspace.
+        required: false
+        default: .
+        type: string
+    secrets:
+      token:
+        description: Token for the target repository.
+        required: true
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+  checks: read
+
+concurrency:
+  group: myque-gh-${{ github.repository }}-${{ inputs.branch }}
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out canonical repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 0
+      - name: Check out myque-gh
+        uses: actions/checkout@v7
+        with:
+          repository: mozufu/myque-gh
+          ref: ${{ inputs.myque-gh-ref }}
+          path: .myque-gh-projector
+      - uses: nixbuild/nix-quick-install-action@v35
+      - name: Reconcile committed canonical branch
+        env:
+          GH_TOKEN: ${{ secrets.token }}
+          MYQUE_GH_BRANCH: ${{ inputs.branch }}
+          MYQUE_GH_PROJECT: ${{ inputs.project }}
+          MYQUE_GH_REPO: ${{ github.repository }}
+          MYQUE_GH_STORE: ${{ inputs.store }}
+        run: |
+          nix run path:.myque-gh-projector#myque-gh -- apply \
+            --store "$GITHUB_WORKSPACE/$MYQUE_GH_STORE" \
+            --repo "$MYQUE_GH_REPO" \
+            --ref "refs/heads/$MYQUE_GH_BRANCH" \
+            --issue-author 'github-actions[bot]' \
+            --project "$MYQUE_GH_PROJECT"
