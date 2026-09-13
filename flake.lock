@@ -1,0 +1,49 @@
+{
+  "nodes": {
+    "myque": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1788658951,
+        "narHash": "sha256-9HVaPCwp7CZbHtwZmeZg9ywb9miK/tgzglNUcCj8Qww=",
+        "owner": "mozufu",
+        "repo": "myque",
+        "rev": "b37ce24c6541d7bf3581e890b5df29c782701cd5",
+        "type": "github"
+      },
+      "original": {
+        "owner": "mozufu",
+        "repo": "myque",
+        "rev": "b37ce24c6541d7bf3581e890b5df29c782701cd5",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1788179007,
+        "narHash": "sha256-hn1oU2rue2SYK8dAr8+WNZWtbsz1S2W5mnHlSEuh3bo=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "34ab99075ac4f7e40cf037eef32cb1c360bb85e9",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "myque": "myque",
+        "nixpkgs": "nixpkgs"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

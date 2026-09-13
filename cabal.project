@@ -1,0 +1,6 @@
+packages: .
+
+source-repository-package
+  type: git
+  location: https://github.com/mozufu/myque.git
+  tag: b37ce24c6541d7bf3581e890b5df29c782701cd5
