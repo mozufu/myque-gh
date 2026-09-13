@@ -13,13 +13,15 @@ import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
-import Myque.Github.Github (discoverGithub, getRepository, graphqlPaginated, restSingle)
+import Myque.Github.Cli (runCli)
+import Myque.Github.Github (discoverGithub, encodePathSegment, getRepository, graphqlPaginated, restSingle)
 import Myque.Github.Markers
 import Myque.Github.Projection (ProjectionContext (..), projectIssue, renderDisplay)
-import Myque.Github.Reconcile (applyParentChange, buildPlan, diffIssue, planIsEmpty, reconcile)
+import Myque.Github.Reconcile (applyIssueDiff, applyParentChange, buildPlan, defaultProjectionQuery, diffIssue, planIsEmpty, reconcile, selectProjection)
 import Myque.Github.Source (decodeBlobBatch, withSnapshot)
 import Myque.Github.Types
 import Myque.Item (Kind (..), State (..), WorkItem (..), newWorkItem)
+import Myque.Query (parseQuery)
 import Myque.Store (Store (..), initLayout, saveItem, storeItems)
 import Myque.Timestamp (parseTimestamp)
 import Myque.Uuid (Uuid, parseUuid)
@@ -41,6 +43,10 @@ main = hspec $ do
             let oid = T.replicate 40 "a"
             decodeBlobBatch [oid] (B8.pack (T.unpack oid <> " blob 4\nabc\n")) `shouldSatisfy` isLeft
             decodeBlobBatch [] "extra" `shouldSatisfy` isLeft
+    describe "path segment encoding" $ do
+        it "percent-encodes UTF-8 bytes and every reserved separator" $ do
+            map encodePathSegment ["abc", "a b", "foo/bar", "#tag", "硬體", "é", "💚"]
+                `shouldBe` ["abc", "a%20b", "foo%2Fbar", "%23tag", "%E7%A1%AC%E9%AB%94", "%C3%A9", "%F0%9F%92%9A"]
     describe "issue markers" $ do
         it "accepts only a leading UUIDv7 header" $ do
             value <- fixtureUuid
@@ -74,6 +80,24 @@ main = hspec $ do
             parsedPrUuids (parsePrLinks sample) `shouldBe` Set.empty
             rewritePrLinks malformed (Set.singleton value) `shouldSatisfy` isLeft
             rewritePrLinks duplicate Set.empty `shouldSatisfy` isLeft
+        it "keeps marker-like trailers inside valid Markdown fences" $ do
+            value <- fixtureUuid
+            let managed = renderTrailerFor value
+                cases =
+                    [ "```md\n" <> managed <> "````\n"
+                    , "```md\r\nexample\r\n```not-closed\r\n" <> T.replace "\n" "\r\n" managed <> "```\r\n"
+                    , "~~~ md\n" <> managed <> "```\n~~~\n"
+                    , "   ```md\n" <> managed <> "   ```\n"
+                    ]
+            map (parsedPrUuids . parsePrLinks) cases `shouldBe` replicate 4 Set.empty
+        it "does not treat four-space-indented fences as fenced code" $ do
+            value <- fixtureUuid
+            let body = "    ```md\n" <> renderTrailerFor value
+            parsedPrUuids (parsePrLinks body) `shouldBe` Set.singleton value
+        it "fails closed for malformed top-level trailers after fenced examples" $ do
+            value <- fixtureUuid
+            let body = "```md\nexample\n```\n<!-- myque:pr-links=github/v1 -->\n<!-- myque:implements=" <> T.pack (show value) <> " -->\n"
+            rewritePrLinks body Set.empty `shouldSatisfy` isLeft
     describe "issue drift" $ do
         it "preserves human labels while replacing managed labels" $ do
             value <- fixtureUuid
@@ -81,55 +105,65 @@ main = hspec $ do
                 actual = GithubIssue 1 1 "N" "bot" "body" "title" IssueOpen Nothing (Set.fromList ["human", "myque:state:done"]) "now" Nothing Nothing
             diffIssue desired actual `shouldBe` [RemoveLabel "myque:state:done", AddLabel "myque:state:open"]
     describe "projection planning" $ do
-        it "creates only first-seen non-terminal items and keeps managed terminal items" $ do
+        it "uses the conservative default and retains trusted projections" $ do
+            snapshot <- fixtureSnapshotWithMilestone
+            taskId <- fixtureUuid
+            milestoneId <- otherUuid
+            selected <- defaultSelection snapshot
+            plan <- requireRight (buildPlan selected fixtureTarget snapshot (fixtureGithub Map.empty []))
+            Map.keys (planIssueCreates plan) `shouldBe` [taskId]
+            let milestone = storeById (snapshotStore snapshot) Map.! milestoneId
+                retained = fixtureIssue 9 milestoneId milestone
+            retainedPlan <- requireRight (buildPlan selected fixtureTarget snapshot (fixtureGithub (Map.singleton milestoneId retained) []))
+            any (\(uuid, _, _) -> uuid == milestoneId) (Map.elems (planIssueChanges retainedPlan)) `shouldBe` True
+        it "filters first projections while retaining terminal managed items" $ do
             snapshot <- fixtureSnapshot
             openId <- fixtureUuid
             doneId <- otherUuid
+            selected <- selectionFor "kind = bug" snapshot
+            plan <- requireRight (buildPlan selected fixtureTarget snapshot (fixtureGithub Map.empty []))
+            planIssueCreates plan `shouldBe` Map.empty
             let openItem = storeById (snapshotStore snapshot) Map.! openId
                 doneItem = storeById (snapshotStore snapshot) Map.! doneId
-                target = fixtureTarget
-                emptyRemote = fixtureGithub Map.empty []
-            plan <- requireRight (buildPlan target snapshot emptyRemote)
-            Map.keys (planIssueCreates plan) `shouldBe` [openId]
-            let existing = fixtureIssue 9 doneId doneItem
-            terminalPlan <- requireRight (buildPlan target snapshot (fixtureGithub (Map.singleton doneId existing) []))
-            any (\(uuid, _, _) -> uuid == doneId) (Map.elems (planIssueChanges terminalPlan)) `shouldBe` True
-            itemState openItem `shouldBe` Open
+                existingOpen = fixtureIssue 8 openId openItem
+                existingDone = fixtureIssue 9 doneId doneItem
+            retainedPlan <- requireRight (buildPlan selected fixtureTarget snapshot (fixtureGithub (Map.fromList [(openId, existingOpen), (doneId, existingDone)]) []))
+            map (\(uuid, _, _) -> uuid) (Map.elems (planIssueChanges retainedPlan)) `shouldMatchList` [openId, doneId]
+        it "adds filtered-out parents through closure" $ do
+            snapshot <- fixtureSnapshotWithParentKinds
+            parentId <- fixtureUuid
+            childId <- otherUuid
+            selected <- defaultSelection snapshot
+            selected `shouldBe` Set.singleton childId
+            plan <- requireRight (buildPlan selected fixtureTarget snapshot (fixtureGithub Map.empty []))
+            Map.keys (planIssueCreates plan) `shouldMatchList` [parentId, childId]
+            let childItem = storeById (snapshotStore snapshot) Map.! childId
+            planParentChanges plan `shouldBe` Map.singleton childId (renderDisplay snapshot childItem, Just parentId)
+        it "does not create terminal unprojected matches" $ do
+            snapshot <- fixtureSnapshot
+            doneId <- otherUuid
+            selected <- selectionFor "state = done" snapshot
+            selected `shouldBe` Set.empty
+            plan <- requireRight (buildPlan selected fixtureTarget snapshot (fixtureGithub Map.empty []))
+            Map.member doneId (planIssueCreates plan) `shouldBe` False
         it "rejects case-colliding managed tag labels before mutation" $ do
             snapshot <- fixtureSnapshotWithTags ["Foo", "foo"]
-            buildPlan fixtureTarget snapshot (fixtureGithub Map.empty []) `shouldSatisfy` isLeft
-        it "creates terminal ancestors and plans native parent changes" $ do
-            snapshot <- fixtureSnapshotWithParent
-            parentId <- fixtureUuid
-            childId <- otherUuid
-            let parentItem = storeById (snapshotStore snapshot) Map.! parentId
-                childItem = storeById (snapshotStore snapshot) Map.! childId
-                parentIssue = fixtureIssue 7 parentId parentItem
-                childIssue = fixtureIssue 8 childId childItem
-                issues = Map.fromList [(parentId, parentIssue), (childId, childIssue)]
-            createPlan <- requireRight (buildPlan fixtureTarget snapshot (fixtureGithub Map.empty []))
-            Map.keys (planIssueCreates createPlan) `shouldMatchList` [parentId, childId]
-            planParentChanges createPlan `shouldBe` Map.singleton childId (renderDisplay snapshot childItem, Just parentId)
-            linkPlan <- requireRight (buildPlan fixtureTarget snapshot (fixtureGithub issues []))
-            planParentChanges linkPlan `shouldBe` Map.singleton childId (renderDisplay snapshot childItem, Just parentId)
-            childOnly <- requireRight (buildPlan fixtureTarget snapshot (fixtureGithub (Map.singleton childId childIssue) []))
-            planParentChanges childOnly `shouldBe` Map.singleton childId (renderDisplay snapshot childItem, Just parentId)
-            let linkedChild = childIssue{githubIssueParent = Just (GithubIssueRef "owner" "repo" 7)}
-            converged <- requireRight (buildPlan fixtureTarget snapshot (fixtureGithub (Map.insert childId linkedChild issues) []))
-            planParentChanges converged `shouldBe` Map.empty
+            selected <- defaultSelection snapshot
+            buildPlan selected fixtureTarget snapshot (fixtureGithub Map.empty []) `shouldSatisfy` isLeft
         it "plans removal and replacement of existing parents" $ do
-            snapshot <- fixtureSnapshotWithParent
+            snapshot <- fixtureSnapshotWithParentKinds
             parentId <- fixtureUuid
             childId <- otherUuid
+            selected <- defaultSelection snapshot
             let parentItem = storeById (snapshotStore snapshot) Map.! parentId
                 childItem = storeById (snapshotStore snapshot) Map.! childId
                 parentIssue = fixtureIssue 7 parentId parentItem
                 childIssue = (fixtureIssue 8 childId childItem){githubIssueParent = Just (GithubIssueRef "owner" "repo" 99)}
                 issues = Map.fromList [(parentId, parentIssue), (childId, childIssue)]
-            replacePlan <- requireRight (buildPlan fixtureTarget snapshot (fixtureGithub issues []))
+            replacePlan <- requireRight (buildPlan selected fixtureTarget snapshot (fixtureGithub issues []))
             Map.lookup childId (planParentChanges replacePlan) `shouldBe` Just (renderDisplay snapshot childItem, Just parentId)
             let detachedSnapshot = snapshotWithoutParent snapshot childId
-            removePlan <- requireRight (buildPlan fixtureTarget detachedSnapshot (fixtureGithub issues []))
+            removePlan <- requireRight (buildPlan selected fixtureTarget detachedSnapshot (fixtureGithub issues []))
             Map.lookup childId (planParentChanges removePlan) `shouldBe` Just (renderDisplay detachedSnapshot childItem{itemParent = Nothing}, Nothing)
         it "applies parent replacement with the child database id" $ do
             parentId <- fixtureUuid
@@ -148,6 +182,22 @@ main = hspec $ do
                     "/repos/owner/repo/issues/7/sub_issues" `shouldSatisfy` (`elem` args)
                     input `shouldSatisfy` maybe False (\body -> B8.isInfixOf "\"sub_issue_id\":800" body && B8.isInfixOf "\"replace_parent\":true" body)
                 _ -> expectationFailure ("unexpected parent mutation calls: " <> show journal)
+        it "encodes Unicode managed-label deletion endpoints" $ do
+            value <- fixtureUuid
+            let desired = DesiredIssue value "A" "title" "body" IssueOpen Nothing Set.empty
+                actual = GithubIssue 1 1 "N" "bot" "body" "title" IssueOpen Nothing (Set.singleton "myque:tag:硬體") "now" Nothing Nothing
+                client = scriptedClient $ \_ args _ -> do
+                    args `shouldSatisfy` elem "/repos/owner/repo/issues/1/labels/myque%3Atag%3A%E7%A1%AC%E9%AB%94"
+                    pure (okIncluded Null)
+            applyIssueDiff client fixtureTarget 1 desired actual
+        it "encodes Unicode canonical source paths by segment" $ do
+            snapshot <- fixtureSnapshot
+            value <- fixtureUuid
+            let item = storeById (snapshotStore snapshot) Map.! value
+                source = (snapshotSource snapshot){sourceLinkRepo = Just ("擁有者", "專案"), sourceLinkBranch = Just "功能/硬體"}
+                linked = snapshot{snapshotSource = source, snapshotSourcePaths = Map.singleton value ".tasks/硬體 設計.md"}
+                desired = projectIssue (ProjectionContext linked fixtureTarget Map.empty) item []
+            desiredBody desired `shouldSatisfy` T.isInfixOf "https://github.com/%E6%93%81%E6%9C%89%E8%80%85/%E5%B0%88%E6%A1%88/blob/%E5%8A%9F%E8%83%BD%2F%E7%A1%AC%E9%AB%94/.tasks/%E7%A1%AC%E9%AB%94%20%E8%A8%AD%E8%A8%88.md"
     describe "GitHub transport" $ do
         it "sends JSON writes through stdin and parses included responses" $ do
             let client = scriptedClient $ \_ args input -> do
@@ -167,6 +217,14 @@ main = hspec $ do
             let client = scriptedClient $ \_ _ _ -> pure (okIncluded (object ["id" .= (7 :: Int), "full_name" .= ("other/repo" :: Text), "archived" .= False, "has_issues" .= True]))
             mismatch <- try (getRepository client fixtureTarget)
             failureCodeOf mismatch `shouldBe` Just 1
+    describe "projection CLI" $ do
+        it "rejects an invalid project query before GitHub discovery" $ withSystemTempDirectory "myque-gh-invalid-query" $ \root -> do
+            initializeRepo root
+            writeFile (root </> ".tasks" </> "items" </> "019a10d8-8d48-7b77-a414-f95ab7af31be.md") itemOne
+            git root ["add", "."]
+            gitEnv root ["commit", "-m", "fixture"]
+            result <- runCli ["plan", "--store", root, "--repo", "owner/repo", "--project", "kind ="]
+            result `shouldBe` ExitFailure 1
     describe "writer transactions" $ do
         it "rediscovers an existing projection without duplicate writes" $ withWriterSnapshot $ \spec snapshot -> do
             value <- fixtureUuid
@@ -175,7 +233,7 @@ main = hspec $ do
                 issue = issueFromDesired 7 desired
             journal <- newIORef []
             let client = statefulClient journal (const (pure (WriterStable issue)))
-            plan <- reconcile client spec fixtureTarget snapshot
+            plan <- reconcile (Set.singleton value) client spec fixtureTarget snapshot
             planIsEmpty plan `shouldBe` True
             calls <- readIORef journal
             filter isWriteCall calls `shouldBe` []
@@ -188,7 +246,7 @@ main = hspec $ do
             let client = scriptedClient $ \_ args _ -> do
                     modifyIORef' journal (<> [args])
                     pure (laggingResponse issue args)
-            plan <- reconcile client spec fixtureTarget snapshot
+            plan <- reconcile (Set.singleton value) client spec fixtureTarget snapshot
             Map.keys (planIssueCreates plan) `shouldBe` [value]
             calls <- readIORef journal
             length (filter (\args -> isWriteCall args && any (isInfixOfArg "/issues") args) calls) `shouldBe` 1
@@ -206,7 +264,7 @@ main = hspec $ do
             let client = scriptedClient $ \_ args _ -> do
                     modifyIORef' journal (<> [args])
                     pure (parentWriterResponse [parentIssue, childIssue] labels tampered args)
-            result <- try (reconcile client spec fixtureTarget snapshot)
+            result <- try (reconcile (Set.fromList [parentId, childId]) client spec fixtureTarget snapshot)
             failureCodeOf result `shouldBe` Just 1
             calls <- readIORef journal
             filter (any (isInfixOfArg "/sub_issues")) calls `shouldBe` []
@@ -221,7 +279,8 @@ main = hspec $ do
                             moveMainRef (sourceRoot spec)
                             pure WriterEmpty
                         else pure WriterEmpty
-            result <- try (reconcile client spec fixtureTarget snapshot)
+            value <- fixtureUuid
+            result <- try (reconcile (Set.singleton value) client spec fixtureTarget snapshot)
             failureCodeOf result `shouldBe` Just 3
             calls <- readIORef journal
             filter isWriteCall calls `shouldBe` []
@@ -235,7 +294,8 @@ main = hspec $ do
                             writeIORef repositoryReads (count + 1)
                             pure (WriterRepositoryId (if count == 0 then 1 else 2))
                         else pure WriterEmpty
-            result <- try (reconcile client spec fixtureTarget snapshot)
+            value <- fixtureUuid
+            result <- try (reconcile (Set.singleton value) client spec fixtureTarget snapshot)
             failureCodeOf result `shouldBe` Just 3
             calls <- readIORef journal
             filter isWriteCall calls `shouldBe` []
@@ -312,21 +372,42 @@ fixtureSnapshot = makeSnapshot []
 
 fixtureSnapshotWithTags :: [Text] -> IO Snapshot
 fixtureSnapshotWithTags = makeSnapshot
+fixtureSnapshotWithMilestone :: IO Snapshot
+fixtureSnapshotWithMilestone = makeKindSnapshot Task Milestone
 
-fixtureSnapshotWithParent :: IO Snapshot
-fixtureSnapshotWithParent = withSystemTempDirectory "myque-gh-parent-fixture" $ \root -> do
+fixtureSnapshotWithParentKinds :: IO Snapshot
+fixtureSnapshotWithParentKinds = withSystemTempDirectory "myque-gh-parent-kind-fixture" $ \root -> do
     layout <- initLayout root
     created <- either fail pure (parseTimestamp "2026-08-20T06:21:00Z")
     parentId <- fixtureUuid
     childId <- otherUuid
-    let parentItem = (newWorkItem parentId Task created "terminal parent"){itemState = Done, itemClosed = Just created}
-        childItem = (newWorkItem childId Task created "open child"){itemParent = Just parentId}
-
+    let parentItem = newWorkItem parentId Milestone created "roadmap container"
+        childItem = (newWorkItem childId Task created "selected child"){itemParent = Just parentId}
     mapM_ (saveItem layout) [parentItem, childItem]
     git root ["init", "-q"]
     git root ["add", "."]
     gitEnv root ["commit", "-m", "fixture"]
     withSnapshot (SourceSpec root "HEAD" Nothing Nothing Nothing) pure
+
+makeKindSnapshot :: Kind -> Kind -> IO Snapshot
+makeKindSnapshot firstKind secondKind = withSystemTempDirectory "myque-gh-kind-fixture" $ \root -> do
+    layout <- initLayout root
+    created <- either fail pure (parseTimestamp "2026-08-20T06:21:00Z")
+    first <- fixtureUuid
+    second <- otherUuid
+    mapM_ (saveItem layout) [newWorkItem first firstKind created "first item", newWorkItem second secondKind created "second item"]
+    git root ["init", "-q"]
+    git root ["add", "."]
+    gitEnv root ["commit", "-m", "fixture"]
+    withSnapshot (SourceSpec root "HEAD" Nothing Nothing Nothing) pure
+
+selectionFor :: Text -> Snapshot -> IO (Set.Set Uuid)
+selectionFor expression snapshot = do
+    query <- either fail pure (parseQuery expression)
+    either (fail . T.unpack) pure (selectProjection query snapshot)
+
+defaultSelection :: Snapshot -> IO (Set.Set Uuid)
+defaultSelection = selectionFor defaultProjectionQuery
 
 blankIssue :: Int -> Uuid -> GithubIssue
 blankIssue number value = GithubIssue (fromIntegral number) number ("node" <> T.pack (show number)) "bot" (renderIssueIdentity value) "" IssueOpen Nothing Set.empty "now" Nothing Nothing

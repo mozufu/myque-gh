@@ -3,11 +3,14 @@
 
 -- | Plan and apply guarded convergence from canonical state to GitHub.
 module Myque.Github.Reconcile (
+    defaultProjectionQuery,
+    selectProjection,
     buildPlan,
     diffIssue,
     renderPlan,
     planIsEmpty,
     applyParentChange,
+    applyIssueDiff,
     reconcile,
 ) where
 
@@ -35,15 +38,31 @@ import Myque.Github.Projection
 import Myque.Github.Source (resolveSourceRef)
 import Myque.Github.Types
 import Myque.Item (WorkItem (..), isTerminal)
+import Myque.Query (Query, runQuery)
 import Myque.Store (Store (..))
 import Myque.Uuid (Uuid, uuidText)
 import System.Directory (XdgDirectory (XdgCache), createDirectoryIfMissing, getXdgDirectory)
 import System.FileLock (SharedExclusive (Exclusive), tryLockFile, unlockFile)
 import System.FilePath (takeDirectory, (</>))
 
+-- | Conservative default: project executable work, not roadmap containers.
+defaultProjectionQuery :: Text
+defaultProjectionQuery = "kind = task or kind = bug or kind = issue"
+
+-- | Evaluate the user query before any remote discovery or mutation.
+selectProjection :: Query -> Snapshot -> Either Text (Set.Set Uuid)
+selectProjection query snapshot =
+    Set.fromList . map itemId . filter (not . isTerminal . itemState)
+        <$> either (Left . T.pack) Right (runQuery (snapshotStore snapshot) query)
+
 -- | Construct the complete deterministic convergence plan.
-buildPlan :: Target -> Snapshot -> GithubSnapshot -> Either [Conflict] Plan
-buildPlan target snapshot github = do
+buildPlan :: Set.Set Uuid -> Target -> Snapshot -> GithubSnapshot -> Either [Conflict] Plan
+buildPlan querySelected target snapshot github = do
+    let
+        retained = Map.keysSet (Map.intersection canonical (githubIssueByUuid github))
+        projected = parentClosure canonical (querySelected `Set.union` retained)
+        selected = [(uuid, item) | (uuid, item) <- Map.toAscList canonical, Set.member uuid projected]
+        selectedItems = map snd selected
     tagCollisionCheck selectedItems
     parentReferenceCheck selected
     let issueNumbers = Map.map githubIssueNumber (githubIssueByUuid github)
@@ -74,11 +93,8 @@ buildPlan target snapshot github = do
             ]
     pure Plan{planLabelCreates = labelCreates, planIssueCreates = creates, planIssueChanges = changes, planParentChanges = parentChanges, planWarnings = githubWarnings github <> orphanWarnings}
   where
-    canonical = storeById (snapshotStore snapshot)
-    initiallyProjected = Set.fromList [uuid | (uuid, item) <- Map.toAscList canonical, not (isTerminal (itemState item)) || Map.member uuid (githubIssueByUuid github)]
-    projected = parentClosure canonical initiallyProjected
-    selected = [(uuid, item) | (uuid, item) <- Map.toAscList canonical, Set.member uuid projected]
-    selectedItems = map snd selected
+    store = snapshotStore snapshot
+    canonical = storeById store
 
 parentClosure :: Map.Map Uuid WorkItem -> Set.Set Uuid -> Set.Set Uuid
 parentClosure canonical initial = go initial (Set.toList initial)
@@ -178,10 +194,10 @@ planIsEmpty :: Plan -> Bool
 planIsEmpty plan = null (planLabelCreates plan) && Map.null (planIssueCreates plan) && Map.null (planIssueChanges plan) && Map.null (planParentChanges plan)
 
 -- | Apply a guarded plan, rediscover GitHub, and require convergence.
-reconcile :: GithubClient -> SourceSpec -> Target -> Snapshot -> IO Plan
-reconcile client spec target snapshot = withTargetLock target $ do
+reconcile :: Set.Set Uuid -> GithubClient -> SourceSpec -> Target -> Snapshot -> IO Plan
+reconcile querySelected client spec target snapshot = withTargetLock target $ do
     initialGithub <- discoverGithub client target snapshot
-    initialPlan <- either conflicts pure (buildPlan target snapshot initialGithub)
+    initialPlan <- either conflicts pure (buildPlan querySelected target snapshot initialGithub)
     let initialRepository = githubRepository initialGithub
     forM_ (planLabelCreates initialPlan) $ \name -> do
         guardTarget client spec snapshot target initialRepository
@@ -197,14 +213,14 @@ reconcile client spec target snapshot = withTargetLock target $ do
                 , githubIssueByUuid = Map.union (githubIssueByUuid observed) created
                 }
         refreshedWithCreates = withCreates refreshed
-    postCreatePlan <- either conflicts pure (buildPlan target snapshot refreshedWithCreates)
+    postCreatePlan <- either conflicts pure (buildPlan querySelected target snapshot refreshedWithCreates)
     forM_ (Map.toAscList (planIssueChanges postCreatePlan)) $ \(number, (uuid, _display, _changes)) -> do
         guardTarget client spec snapshot target initialRepository
         current <- getIssue client target number
         verifyManaged target uuid current
         applyIssueDiff client target number (lookupDesired target snapshot refreshedWithCreates uuid) current
     refreshedFields <- withCreates <$> discoverGithub client target snapshot
-    parentPlan <- either conflicts pure (buildPlan target snapshot refreshedFields)
+    parentPlan <- either conflicts pure (buildPlan querySelected target snapshot refreshedFields)
     forM_ (parentOrder snapshot (Map.keysSet (planParentChanges parentPlan))) $ \uuid -> do
         guardTarget client spec snapshot target initialRepository
         let desiredParent = snd (planParentChanges parentPlan Map.! uuid)
@@ -213,7 +229,7 @@ reconcile client spec target snapshot = withTargetLock target $ do
     finalObserved <- withCreates <$> discoverGithub client target snapshot
     verified <- traverse (verifyCurrentIssue client target snapshot finalObserved) (Map.toAscList (githubIssueByUuid finalObserved))
     let finalGithub = finalObserved{githubIssueByUuid = Map.fromList verified}
-    finalPlan <- either conflicts pure (buildPlan target snapshot finalGithub)
+    finalPlan <- either conflicts pure (buildPlan querySelected target snapshot finalGithub)
     unless (planIsEmpty finalPlan) (throwIO Failure{failureCode = 3, failureDiagnostic = "not-converged\n" <> renderPlan target snapshot finalPlan})
     pure initialPlan
 
@@ -288,6 +304,7 @@ createIssue client spec target snapshot repository mapping (uuid, desired) = do
 parseCreatedIssue :: Value -> Parser GithubIssue
 parseCreatedIssue = parseIssue
 
+-- | Apply only the managed issue drift computed by 'diffIssue'.
 applyIssueDiff :: GithubClient -> Target -> Int -> DesiredIssue -> GithubIssue -> IO ()
 applyIssueDiff client target number desired current = do
     let changes = diffIssue desired current

@@ -140,19 +140,26 @@ lastMatchingBefore needle bound lines' = case [i | (i, line) <- zip [0 .. bound 
     [] -> Nothing
     matches -> Just (last matches)
 
-insideFence :: [Text] -> Int -> Bool
-insideFence lines' stop = fst (foldl track (False, Nothing) (take stop lines'))
-  where
-    track (open, current) line = case fenceToken line of
-        Nothing -> (open, current)
-        Just token
-            | not open -> (True, Just token)
-            | closes token current -> (False, Nothing)
-            | otherwise -> (open, current)
-    closes token (Just current) = fst token == fst current && snd token >= snd current && T.all isSpace (T.drop (snd token) (T.dropWhile (== ' ') (T.dropWhile (== '\t') "")))
-    closes _ Nothing = False
+data Fence = Fence
+    { fenceChar :: Char
+    , fenceLength :: Int
+    , fenceTrailing :: Text
+    }
 
-fenceToken :: Text -> Maybe (Char, Int)
+insideFence :: [Text] -> Int -> Bool
+insideFence lines' stop = maybe False (const True) (foldl track Nothing (take stop lines'))
+  where
+    track Nothing line = fenceToken line
+    track current@(Just opening) line = case fenceToken line of
+        Just candidate
+            | closes opening candidate -> Nothing
+        _ -> current
+    closes opening candidate =
+        fenceChar candidate == fenceChar opening
+            && fenceLength candidate >= fenceLength opening
+            && T.all isSpace (fenceTrailing candidate)
+
+fenceToken :: Text -> Maybe Fence
 fenceToken line =
     let stripped = T.dropWhile (== ' ') line
         indent = T.length line - T.length stripped
@@ -161,8 +168,11 @@ fenceToken line =
             else case T.uncons stripped of
                 Just (char, _)
                     | char == '`' || char == '~' ->
-                        let count = T.length (T.takeWhile (== char) stripped)
-                         in if count >= 3 then Just (char, count) else Nothing
+                        let run = T.takeWhile (== char) stripped
+                            count = T.length run
+                         in if count >= 3
+                                then Just Fence{fenceChar = char, fenceLength = count, fenceTrailing = T.drop count stripped}
+                                else Nothing
                 _ -> Nothing
 
 splitAtLine :: Int -> Text -> (Text, Text)

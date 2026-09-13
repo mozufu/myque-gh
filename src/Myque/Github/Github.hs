@@ -26,7 +26,7 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as B8
 import Data.ByteString.Lazy qualified as BL
-import Data.Char (isAlphaNum, ord)
+import Data.Char (chr)
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
@@ -39,7 +39,6 @@ import Myque.Github.Markers
 import Myque.Github.Types
 import Myque.Store (Store (..))
 import Myque.Uuid (Uuid)
-import Numeric (showHex)
 import System.Environment (getEnvironment)
 import System.Exit (ExitCode (..))
 import System.Process.Typed (
@@ -416,15 +415,18 @@ repoPath target = "/repos/" <> encodePathSegment (targetOwner target) <> "/" <> 
 
 -- | Percent-encode one path segment without allowing separators through.
 encodePathSegment :: Text -> Text
-encodePathSegment = T.concatMap encodeChar
+encodePathSegment = T.pack . concatMap encodeByte . BS.unpack . TE.encodeUtf8
   where
-    encodeChar char
-        | isAlphaNum char || char `elem` ("-._~" :: String) = T.singleton char
-        | otherwise = T.pack (concatMap (percent . fromEnum) (T.unpack (T.singleton char)))
-    percent value = '%' : pad (map toUpperHex (showHex value ""))
-    pad [single] = ['0', single]
-    pad digits = digits
-    toUpperHex char | char >= 'a' && char <= 'f' = toEnum (ord char - 32); toUpperHex char = char
+    encodeByte byte
+        | isUnreserved byte = [chr (fromIntegral byte)]
+        | otherwise = ['%', hexDigit (byte `div` 16), hexDigit (byte `mod` 16)]
+    isUnreserved byte =
+        (byte >= ascii 'A' && byte <= ascii 'Z')
+            || (byte >= ascii 'a' && byte <= ascii 'z')
+            || (byte >= ascii '0' && byte <= ascii '9')
+            || byte `elem` map ascii ("-._~" :: String)
+    ascii = fromIntegral . fromEnum
+    hexDigit value = "0123456789ABCDEF" !! fromIntegral value
 
 chunksOf :: Int -> [a] -> [[a]]
 chunksOf _ [] = []

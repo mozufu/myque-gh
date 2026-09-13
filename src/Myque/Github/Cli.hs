@@ -18,6 +18,7 @@ import Myque.Github.Source
 import Myque.Github.Types hiding (Failure)
 import Myque.Github.Types qualified as Types
 import Myque.Item (WorkItem (itemId))
+import Myque.Query (parseQuery)
 import Myque.Store (parseSelector, resolveSelector)
 import Options.Applicative hiding (failureCode)
 import System.Exit (ExitCode (..))
@@ -35,6 +36,7 @@ data Common = Common
     , commonRef :: String
     , commonSourceRepo :: Maybe String
     , commonSourceBranch :: Maybe String
+    , commonProject :: String
     }
 
 data PrLink = PrLink
@@ -75,16 +77,18 @@ runProjection :: Bool -> Common -> IO ExitCode
 runProjection applying common = do
     target <- parseTarget (commonRepo common) (commonAuthors common) applying
     source <- parseSource common applying
+    query <- either (config . T.pack) pure (parseQuery (T.pack (commonProject common)))
     withSnapshot source $ \snapshot -> do
+        selected <- either config pure (selectProjection query snapshot)
         if applying
             then do
-                plan <- reconcile defaultGithubClient source target snapshot
+                plan <- reconcile selected defaultGithubClient source target snapshot
                 mapM_ printWarning (planWarnings plan)
                 TIO.putStr (renderPlan target snapshot plan)
                 pure ExitSuccess
             else do
                 github <- discoverGithub defaultGithubClient target snapshot
-                plan <- either throwConflicts pure (buildPlan target snapshot github)
+                plan <- either throwConflicts pure (buildPlan selected target snapshot github)
                 mapM_ printWarning (planWarnings plan)
                 TIO.putStr (renderPlan target snapshot plan)
                 pure ExitSuccess
@@ -192,6 +196,7 @@ commonParser applying =
         <*> strOption (long "ref" <> metavar "REF" <> value (if applying then "" else "HEAD") <> showDefault <> help "Committed source ref; apply requires refs/heads/BRANCH")
         <*> optional (strOption (long "source-repo" <> metavar "OWNER/REPO" <> help "Repository used only for canonical hyperlinks"))
         <*> optional (strOption (long "source-branch" <> metavar "BRANCH" <> help "Branch used only for canonical hyperlinks"))
+        <*> strOption (long "project" <> metavar "QUERY" <> value (T.unpack defaultProjectionQuery) <> showDefault <> help "Myque query selecting first-time projections; trusted existing issues and required parents are retained")
 
 prLinkParser :: Parser PrLink
 prLinkParser =
