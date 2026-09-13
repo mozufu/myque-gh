@@ -71,15 +71,28 @@ main = hspec $ do
             let upper = T.toUpper (T.pack (show value))
                 body = "<!-- myque:pr-links=github/v1 -->\n<!-- myque:implements=" <> upper <> " -->\n<!-- myque:implements=" <> T.pack (show value) <> " -->\n<!-- myque:pr-links:end -->\n"
             parsedPrUuids (parsePrLinks body) `shouldBe` Set.singleton value
-        it "ignores fenced samples and rejects malformed or multiple trailers" $ do
+        it "accepts a real trailer after a fenced example under LF and CRLF" $ do
             value <- fixtureUuid
-            let marker = "<!-- myque:implements=" <> T.pack (show value) <> " -->"
-                sample = "```md\n<!-- myque:pr-links=github/v1 -->\n" <> marker <> "\n<!-- myque:pr-links:end -->\n```\n"
-                malformed = "body\n<!-- myque:pr-links=github/v1 -->\n" <> marker <> "\n"
-                duplicate = T.concat [renderTrailerFor value, "\n", renderTrailerFor value]
-            parsedPrUuids (parsePrLinks sample) `shouldBe` Set.empty
-            rewritePrLinks malformed (Set.singleton value) `shouldSatisfy` isLeft
-            rewritePrLinks duplicate Set.empty `shouldSatisfy` isLeft
+            let body = "Example:\n\n```md\n" <> renderTrailerFor value <> "```\n\nActual metadata:\n\n" <> renderTrailerFor value
+                bodies = [body, T.replace "\n" "\r\n" body]
+            map (parsedPrUuids . parsePrLinks) bodies `shouldBe` replicate 2 (Set.singleton value)
+            map (parsedPrDiagnostics . parsePrLinks) bodies `shouldBe` replicate 2 []
+        it "fails closed for multiple real top-level trailers" $ do
+            value <- fixtureUuid
+            let parsed = parsePrLinks (renderTrailerFor value <> "text\n" <> renderTrailerFor value)
+            parsedPrDiagnostics parsed `shouldBe` ["multiple top-level myque PR trailers"]
+        it "ignores multiple fenced examples without a managed trailer" $ do
+            value <- fixtureUuid
+            let fencedSample fence = fence <> "md\n" <> renderTrailerFor value <> fence <> "\n"
+                parsed = parsePrLinks (fencedSample "```" <> "text\n" <> fencedSample "~~~")
+            parsedPrUuids parsed `shouldBe` Set.empty
+            parsedPrDiagnostics parsed `shouldBe` []
+        it "ignores fenced malformed markers before a valid real trailer" $ do
+            value <- fixtureUuid
+            let fenced = "```md\n<!-- myque:pr-links=github/v1 -->\n<!-- myque:implements=not-a-uuid -->\n```\n"
+                parsed = parsePrLinks (fenced <> renderTrailerFor value)
+            parsedPrUuids parsed `shouldBe` Set.singleton value
+            parsedPrDiagnostics parsed `shouldBe` []
         it "keeps marker-like trailers inside valid Markdown fences" $ do
             value <- fixtureUuid
             let managed = renderTrailerFor value
@@ -90,14 +103,15 @@ main = hspec $ do
                     , "   ```md\n" <> managed <> "   ```\n"
                     ]
             map (parsedPrUuids . parsePrLinks) cases `shouldBe` replicate 4 Set.empty
+            map (parsedPrDiagnostics . parsePrLinks) cases `shouldBe` replicate 4 []
         it "does not treat four-space-indented fences as fenced code" $ do
             value <- fixtureUuid
             let body = "    ```md\n" <> renderTrailerFor value
             parsedPrUuids (parsePrLinks body) `shouldBe` Set.singleton value
         it "fails closed for malformed top-level trailers after fenced examples" $ do
             value <- fixtureUuid
-            let body = "```md\nexample\n```\n<!-- myque:pr-links=github/v1 -->\n<!-- myque:implements=" <> T.pack (show value) <> " -->\n"
-            rewritePrLinks body Set.empty `shouldSatisfy` isLeft
+            let body = "```md\n<!-- myque:pr-links=github/v1 -->\n<!-- myque:implements=bad -->\n```\n<!-- myque:pr-links=github/v1 -->\n<!-- myque:implements=" <> T.pack (show value) <> " -->\n"
+            parsedPrDiagnostics (parsePrLinks body) `shouldBe` ["malformed myque PR trailer candidate at end of body"]
     describe "issue drift" $ do
         it "preserves human labels while replacing managed labels" $ do
             value <- fixtureUuid

@@ -95,20 +95,19 @@ rewritePrLinks body desired = case parseTrailer body of
 
 parseTrailer :: Text -> Either Text (Maybe (Int, Int, Set Uuid))
 parseTrailer body = do
-    let linesWithEnds = splitLines body
-        contents = map fst linesWithEnds
-        nonEmpty = [index | (index, line) <- zip [0 ..] contents, not (T.null (T.strip line))]
+    let contents = map fst (splitLines body)
+        topLevel = topLevelLines contents
+        nonEmpty = [(index, line) | (index, line) <- topLevel, not (T.null (T.strip line))]
         markerLine line = any (`T.isInfixOf` line) ["myque:pr-links", "myque:implements"]
     case reverse nonEmpty of
         [] -> Right Nothing
-        lastIndex : _
-            | contents !! lastIndex == endMarker -> do
-                start <- maybe (Left "myque PR trailer lacks start marker") Right (lastMatchingBefore startMarker lastIndex contents)
-                whenText (insideFence contents start) "myque PR trailer starts inside an unclosed Markdown fence"
-                whenText (any (== startMarker) (take start contents)) "multiple top-level myque PR trailers"
-                uuids <- traverse parseImplements [T.strip line | line <- take (lastIndex - start - 1) (drop (start + 1) contents), not (T.null (T.strip line))]
+        (lastIndex, lastLine) : _
+            | lastLine == endMarker -> do
+                start <- maybe (Left "myque PR trailer lacks start marker") Right (lastMatchingBefore startMarker lastIndex topLevel)
+                whenText (any (\(index, line) -> index < start && line == startMarker) topLevel) "multiple top-level myque PR trailers"
+                uuids <- traverse parseImplements [T.strip line | (index, line) <- topLevel, index > start, index < lastIndex, not (T.null (T.strip line))]
                 Right (Just (start, lastIndex, Set.fromList uuids))
-            | markerLine (contents !! lastIndex) || any markerLine (drop (lastIndex + 1) contents) -> Left "malformed myque PR trailer candidate at end of body"
+            | markerLine lastLine -> Left "malformed myque PR trailer candidate at end of body"
             | otherwise -> Right Nothing
 
 parseImplements :: Text -> Either Text Uuid
@@ -135,8 +134,8 @@ splitLines body = go body
             let ending = if T.isSuffixOf "\r" line then "\r\n" else "\n"
              in (T.dropWhileEnd (== '\r') line, ending) : go (T.drop 1 rest)
 
-lastMatchingBefore :: Text -> Int -> [Text] -> Maybe Int
-lastMatchingBefore needle bound lines' = case [i | (i, line) <- zip [0 .. bound - 1] lines', line == needle] of
+lastMatchingBefore :: Text -> Int -> [(Int, Text)] -> Maybe Int
+lastMatchingBefore needle bound lines' = case [index | (index, line) <- lines', index < bound, line == needle] of
     [] -> Nothing
     matches -> Just (last matches)
 
@@ -146,14 +145,17 @@ data Fence = Fence
     , fenceTrailing :: Text
     }
 
-insideFence :: [Text] -> Int -> Bool
-insideFence lines' stop = maybe False (const True) (foldl track Nothing (take stop lines'))
+topLevelLines :: [Text] -> [(Int, Text)]
+topLevelLines = go 0 Nothing
   where
-    track Nothing line = fenceToken line
-    track current@(Just opening) line = case fenceToken line of
+    go _ _ [] = []
+    go index Nothing (line : rest) = case fenceToken line of
+        Just opening -> go (index + 1) (Just opening) rest
+        Nothing -> (index, line) : go (index + 1) Nothing rest
+    go index current@(Just opening) (line : rest) = case fenceToken line of
         Just candidate
-            | closes opening candidate -> Nothing
-        _ -> current
+            | closes opening candidate -> go (index + 1) Nothing rest
+        _ -> go (index + 1) current rest
     closes opening candidate =
         fenceChar candidate == fenceChar opening
             && fenceLength candidate >= fenceLength opening
