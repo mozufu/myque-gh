@@ -15,6 +15,10 @@ on:
         description: myque-gh Git ref to install.
         required: true
         type: string
+      issue-authors:
+        description: Newline-separated trusted Issue authors; include the token principal and any historical managed-Issue creators.
+        required: true
+        type: string
       store:
         description: Canonical repository root relative to the workspace.
         required: false
@@ -58,10 +62,22 @@ jobs:
           MYQUE_GH_PROJECT: ${{ inputs.project }}
           MYQUE_GH_REPO: ${{ github.repository }}
           MYQUE_GH_STORE: ${{ inputs.store }}
+          MYQUE_GH_ISSUE_AUTHORS: ${{ inputs['issue-authors'] }}
         run: |
+          author_args=()
+          while IFS= read -r author || [ -n "$author" ]; do
+            author="${author%$'\r'}"
+            [ -z "$author" ] && continue
+            author_args+=(--issue-author "$author")
+          done <<< "$MYQUE_GH_ISSUE_AUTHORS"
+          if [ "${#author_args[@]}" -eq 0 ]; then
+            echo "issue-authors must contain at least one trusted login" >&2
+            exit 2
+          fi
+
           nix run path:.myque-gh-projector#myque-gh -- apply \
             --store "$GITHUB_WORKSPACE/$MYQUE_GH_STORE" \
             --repo "$MYQUE_GH_REPO" \
             --ref "refs/heads/$MYQUE_GH_BRANCH" \
-            --issue-author 'github-actions[bot]' \
+            "${author_args[@]}" \
             --project "$MYQUE_GH_PROJECT"

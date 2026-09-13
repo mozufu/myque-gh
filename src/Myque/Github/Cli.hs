@@ -75,7 +75,7 @@ runCommand parsedCommand = case parsedCommand of
 
 runProjection :: Bool -> Common -> IO ExitCode
 runProjection applying common = do
-    target <- parseTarget (commonRepo common) (commonAuthors common) applying
+    target <- parseTarget (commonRepo common) (commonAuthors common) True
     source <- parseSource common applying
     query <- either (config . T.pack) pure (parseQuery (T.pack (commonProject common)))
     withSnapshot source $ \snapshot -> do

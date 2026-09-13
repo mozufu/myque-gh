@@ -143,6 +143,22 @@ main = hspec $ do
                 existingDone = fixtureIssue 9 doneId doneItem
             retainedPlan <- requireRight (buildPlan selected fixtureTarget snapshot (fixtureGithub (Map.fromList [(openId, existingOpen), (doneId, existingDone)]) []))
             map (\(uuid, _, _) -> uuid) (Map.elems (planIssueChanges retainedPlan)) `shouldMatchList` [openId, doneId]
+        it "retains historical trusted projections excluded by the query" $ do
+            snapshot <- fixtureSnapshot
+            value <- fixtureUuid
+            selected <- selectionFor "kind = bug" snapshot
+            let item = storeById (snapshotStore snapshot) Map.! value
+                historicalIssue = (fixtureIssue 8 value item){githubIssueAuthor = "historical-author", githubIssueTitle = "stale title"}
+                migrationTarget = fixtureTarget{targetIssueAuthors = Set.fromList ["historical-author", "automation-bot"]}
+                automationOnly = fixtureTarget{targetIssueAuthors = Set.singleton "automation-bot"}
+            trustedGithub <- discoverGithub (discoveryClientWithIssues [historicalIssue] [] emptyPullRequests) migrationTarget snapshot
+            trustedPlan <- requireRight (buildPlan selected migrationTarget snapshot trustedGithub)
+            planIssueCreates trustedPlan `shouldBe` Map.empty
+            Map.keys (planIssueChanges trustedPlan) `shouldBe` [8]
+            untrustedGithub <- discoverGithub (discoveryClientWithIssues [historicalIssue] [] emptyPullRequests) automationOnly snapshot
+            Map.member value (githubIssueByUuid untrustedGithub) `shouldBe` False
+            githubWarnings untrustedGithub
+                `shouldBe` [Warning "untrusted-identity-claim" ("issue #8 by historical-author claims " <> T.pack (show value))]
         it "adds filtered-out parents through closure" $ do
             snapshot <- fixtureSnapshotWithParentKinds
             parentId <- fixtureUuid
@@ -232,12 +248,20 @@ main = hspec $ do
             mismatch <- try (getRepository client fixtureTarget)
             failureCodeOf mismatch `shouldBe` Just 1
     describe "projection CLI" $ do
+        it "requires trusted authors for plan and apply before local or GitHub access" $ do
+            planResult <- runCli ["plan", "--store", "/missing", "--repo", "owner/repo"]
+            applyResult <- runCli ["apply", "--store", "/missing", "--repo", "owner/repo", "--ref", "refs/heads/main"]
+            planResult `shouldBe` ExitFailure 2
+            applyResult `shouldBe` ExitFailure 2
+        it "keeps pr link independent of issue author configuration" $ do
+            result <- runCli ["pr", "link", "0", "--store", "/missing", "--repo", "owner/repo", "--clear"]
+            result `shouldBe` ExitFailure 2
         it "rejects an invalid project query before GitHub discovery" $ withSystemTempDirectory "myque-gh-invalid-query" $ \root -> do
             initializeRepo root
             writeFile (root </> ".tasks" </> "items" </> "019a10d8-8d48-7b77-a414-f95ab7af31be.md") itemOne
             git root ["add", "."]
             gitEnv root ["commit", "-m", "fixture"]
-            result <- runCli ["plan", "--store", root, "--repo", "owner/repo", "--project", "kind ="]
+            result <- runCli ["plan", "--store", root, "--repo", "owner/repo", "--issue-author", "bot", "--project", "kind ="]
             result `shouldBe` ExitFailure 1
     describe "writer transactions" $ do
         it "rediscovers an existing projection without duplicate writes" $ withWriterSnapshot $ \spec snapshot -> do
@@ -612,9 +636,12 @@ repositoryValue :: Value
 repositoryValue = object ["id" .= (1 :: Int), "full_name" .= ("owner/repo" :: Text), "archived" .= False, "has_issues" .= True]
 
 discoveryClient :: [Value] -> Value -> GithubClient
-discoveryClient prs facts = scriptedClient $ \_ args _ -> pure $ case args of
+discoveryClient = discoveryClientWithIssues []
+
+discoveryClientWithIssues :: [GithubIssue] -> [Value] -> Value -> GithubClient
+discoveryClientWithIssues issues prs facts = scriptedClient $ \_ args _ -> pure $ case args of
     _ | "--include" `elem` args && "/repos/owner/repo" `elem` args -> okIncluded repositoryValue
-    _ | any (isInfixOfArg "/issues?") args -> jsonResult (Array mempty)
+    _ | any (isInfixOfArg "/issues?") args -> jsonResult (Array (foldMap (pure . issueValue) issues))
     _ | any (isInfixOfArg "/labels?") args -> jsonResult (Array mempty)
     _ | "graphql" `elem` args && any (isInfixOfArg "statusCheckRollup") args -> jsonResult facts
     _ | "graphql" `elem` args -> jsonResult (object ["data" .= object ["repository" .= object ["pullRequests" .= object ["nodes" .= prs, "pageInfo" .= object ["hasNextPage" .= False, "endCursor" .= Null]]]]])

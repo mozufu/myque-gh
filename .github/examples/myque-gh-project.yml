@@ -20,6 +20,13 @@ jobs:
     with:
       branch: main
       myque-gh-ref: PINNED_RELEASE_OR_SHA
+      # Trust the authenticated token principal: github-actions[bot] for
+      # GITHUB_TOKEN, the owning login for a PAT, or app-slug[bot] for an App.
+      # Also include historical creators when adopting myque-gh onto a
+      # repository that already contains managed projections; removing them
+      # later does not transfer or recreate those Issues.
+      issue-authors: |
+        github-actions[bot]
       project: kind = task or kind = bug or kind = issue
     secrets:
       token: ${{ secrets.GITHUB_TOKEN }}
