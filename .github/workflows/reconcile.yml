@@ -24,6 +24,14 @@ on:
         required: false
         default: .
         type: string
+      source-repo:
+        description: Repository (OWNER/REPO) used only for canonical hyperlinks; supply together with source-branch.
+        required: false
+        type: string
+      source-branch:
+        description: Branch used only for canonical hyperlinks; supply together with source-repo.
+        required: false
+        type: string
     secrets:
       token:
         description: Token for the target repository.
@@ -63,6 +71,8 @@ jobs:
           MYQUE_GH_REPO: ${{ github.repository }}
           MYQUE_GH_STORE: ${{ inputs.store }}
           MYQUE_GH_ISSUE_AUTHORS: ${{ inputs['issue-authors'] }}
+          MYQUE_GH_SOURCE_REPO: ${{ inputs['source-repo'] }}
+          MYQUE_GH_SOURCE_BRANCH: ${{ inputs['source-branch'] }}
         run: |
           author_args=()
           while IFS= read -r author || [ -n "$author" ]; do
@@ -75,9 +85,18 @@ jobs:
             exit 2
           fi
 
+          source_args=()
+          if [ -n "$MYQUE_GH_SOURCE_REPO" ]; then
+            source_args+=(--source-repo "$MYQUE_GH_SOURCE_REPO")
+          fi
+          if [ -n "$MYQUE_GH_SOURCE_BRANCH" ]; then
+            source_args+=(--source-branch "$MYQUE_GH_SOURCE_BRANCH")
+          fi
+
           nix run path:.myque-gh-projector#myque-gh -- apply \
             --store "$GITHUB_WORKSPACE/$MYQUE_GH_STORE" \
             --repo "$MYQUE_GH_REPO" \
             --ref "refs/heads/$MYQUE_GH_BRANCH" \
             "${author_args[@]}" \
+            "${source_args[@]}" \
             --project "$MYQUE_GH_PROJECT"

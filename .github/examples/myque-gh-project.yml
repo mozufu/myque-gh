@@ -28,5 +28,9 @@ jobs:
       issue-authors: |
         github-actions[bot]
       project: kind = task or kind = bug or kind = issue
+      # Optional canonical hyperlink overrides; supply both or omit both.
+      # These do not change the checkout branch or target Issue repository.
+      # source-repo: OWNER/REPO
+      # source-branch: main
     secrets:
       token: ${{ secrets.GITHUB_TOKEN }}
