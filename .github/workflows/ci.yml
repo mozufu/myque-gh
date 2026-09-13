@@ -3,14 +3,43 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    name: Check (${{ matrix.system }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            system: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            system: aarch64-linux
+          - runner: macos-15-intel
+            system: x86_64-darwin
+          - runner: macos-15
+            system: aarch64-darwin
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
       - uses: nixbuild/nix-quick-install-action@v35
-      - run: nix flake check path:.
+      - run: nix build path:.#checks.${{ matrix.system }}.myque-gh
+
+  hosted-smoke:
+    if: github.repository == 'mozufu/myque-gh' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: nixbuild/nix-quick-install-action@v35
+      - run: nix run path:.#myque-gh-hosted-smoke -- --repo mozufu/myque-gh --allow-write
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: mozufu/myque-gh
+          MYQUE_GH_ISSUE_AUTHOR: github-actions[bot]
