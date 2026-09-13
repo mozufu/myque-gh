@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 
+-- | Command-line parsing and failure-to-exit-code translation.
 module Myque.Github.Cli (runCli) where
 
 import Control.Exception (catch, throwIO)
@@ -46,6 +47,7 @@ data PrLink = PrLink
     , prClear :: Bool
     }
 
+-- | Parse and execute one command-line invocation.
 runCli :: [String] -> IO ExitCode
 runCli arguments = handleFailure $ case execParserPure defaultPrefs parserInfo arguments of
     Success parsedCommand -> runCommand parsedCommand

@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 
+-- | Load and validate immutable canonical state directly from a Git commit.
 module Myque.Github.Source (
     withSnapshot,
     decodeBlobBatch,
@@ -64,6 +65,7 @@ data TreeEntry = TreeEntry
     }
     deriving (Eq, Show)
 
+-- | Materialize the configured work-item tree from one commit for the duration of an action.
 withSnapshot :: SourceSpec -> (Snapshot -> IO a) -> IO a
 withSnapshot spec action = do
     root <- ensureRepositoryRoot (sourceRoot spec)
@@ -108,6 +110,7 @@ withSnapshot spec action = do
                 , snapshotSourcePaths = relativeSources
                 }
 
+-- | Resolve a revision to one immutable commit SHA.
 resolveSourceRef :: FilePath -> Text -> IO Text
 resolveSourceRef root ref = do
     result <- runGit root ["rev-parse", "--verify", "--end-of-options", T.unpack ref <> "^{commit}"] Nothing
@@ -115,6 +118,7 @@ resolveSourceRef root ref = do
         ExitSuccess -> decodeLine 2 "invalid git commit output" (commandStdout result)
         _ -> throwFailure 2 ("cannot resolve source ref " <> ref <> diagnosticSuffix result)
 
+-- | Require an apply source to be a syntactically valid local branch ref.
 validatePublicationRef :: FilePath -> Text -> IO ()
 validatePublicationRef root ref = do
     unless ("refs/heads/" `T.isPrefixOf` ref && ref /= "refs/heads/") (throwFailure 2 "apply --ref must be a full refs/heads/... name")
@@ -222,6 +226,7 @@ readBlobs root oids = do
         ExitSuccess -> either (throwFailure 2 . T.pack) pure (decodeBlobBatch oids (commandStdout result))
         _ -> throwFailure 2 ("cannot batch-read Git blobs" <> diagnosticSuffix result)
 
+-- | Decode the exact framing emitted by @git cat-file --batch@.
 decodeBlobBatch :: [Text] -> ByteString -> Either String (Map Text ByteString)
 decodeBlobBatch requested raw = go requested raw Map.empty
   where

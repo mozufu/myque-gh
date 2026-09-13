@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 
+-- | Render canonical work items into managed GitHub issue fields.
 module Myque.Github.Projection (
     ProjectionContext (..),
     projectIssue,
@@ -30,12 +31,14 @@ import Myque.Render (label)
 import Myque.Store (Store (..))
 import Myque.Uuid (Uuid, uuidText)
 
+-- | Immutable context needed to render links and relationship displays.
 data ProjectionContext = ProjectionContext
     { projectionSnapshot :: Snapshot
     , projectionTarget :: Target
     , projectionIssueNumbers :: Map.Map Uuid Int
     }
 
+-- | Project one canonical item and its linked pull requests into owned issue fields.
 projectIssue :: ProjectionContext -> WorkItem -> [LinkedPr] -> DesiredIssue
 projectIssue context item linkedPrs =
     DesiredIssue
@@ -54,6 +57,7 @@ projectIssue context item linkedPrs =
         Cancelled -> (IssueClosed, Just NotPlanned)
         _ -> (IssueOpen, Nothing)
 
+-- | Compute the complete set of labels owned by @myque-gh@.
 managedLabels :: WorkItem -> Set Text
 managedLabels item =
     Set.fromList
@@ -61,6 +65,7 @@ managedLabels item =
             <> map ("myque:tag:" <>) (itemTags item)
         )
 
+-- | Render the stable human-facing selector for a canonical work item.
 renderDisplay :: Snapshot -> WorkItem -> Text
 renderDisplay snapshot item = label (snapshotAbbrev snapshot) item
 

@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 
+-- | Trusted machine markers embedded in issue and pull-request bodies.
 module Myque.Github.Markers (
     MarkerError (..),
     ParsedPrLinks (..),
@@ -16,9 +17,11 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Myque.Uuid (Uuid, isUuidV7, parseUuid, uuidText)
 
+-- | Invalid or ambiguous managed marker syntax.
 data MarkerError = MarkerError Text
     deriving (Eq, Show)
 
+-- | Parsed work-item links and any trailer diagnostics.
 data ParsedPrLinks = ParsedPrLinks
     { parsedPrUuids :: Set Uuid
     , parsedPrDiagnostics :: [Text]
@@ -32,6 +35,7 @@ issuePrefix = "<!-- myque:id="
 projectionLine :: Text
 projectionLine = "<!-- myque:projection=github/v1 -->"
 
+-- | Parse a managed issue identity only when it begins the body.
 parseIssueIdentity :: Text -> Either MarkerError (Maybe Uuid)
 parseIssueIdentity body = case normalizedLines body of
     first : second : rest
@@ -47,6 +51,7 @@ parseIssueIdentity body = case normalizedLines body of
         | issuePrefix `T.isPrefixOf` first -> Left (MarkerError "identity header is incomplete")
     _ -> Right Nothing
 
+-- | Render the trusted two-line managed issue identity header.
 renderIssueIdentity :: Uuid -> Text
 renderIssueIdentity uuid = issuePrefix <> uuidText uuid <> " -->\n" <> projectionLine <> "\n"
 
@@ -65,12 +70,14 @@ endMarker = "<!-- myque:pr-links:end -->"
 implementsPrefix :: Text
 implementsPrefix = "<!-- myque:implements="
 
+-- | Parse the optional managed trailer at the end of a pull-request body.
 parsePrLinks :: Text -> ParsedPrLinks
 parsePrLinks body = case parseTrailer body of
     Right Nothing -> ParsedPrLinks Set.empty [] Nothing
     Right (Just (start, end, uuids)) -> ParsedPrLinks uuids [] (Just (start, end))
     Left message -> ParsedPrLinks Set.empty [message] Nothing
 
+-- | Replace or remove the managed pull-request trailer without touching human text.
 rewritePrLinks :: Text -> Set Uuid -> Either MarkerError Text
 rewritePrLinks body desired = case parseTrailer body of
     Left message -> Left (MarkerError message)
