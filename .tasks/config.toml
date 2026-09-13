@@ -1,0 +1,4 @@
+schema = "tracker-config/v1"
+
+[storage]
+items = ".tasks/items"
