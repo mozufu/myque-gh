@@ -15,8 +15,8 @@ import Data.Text (Text)
 import Data.Text qualified as T
 import Myque.Github.Github (discoverGithub, getRepository, graphqlPaginated, restSingle)
 import Myque.Github.Markers
-import Myque.Github.Projection (ProjectionContext (..), projectIssue)
-import Myque.Github.Reconcile (buildPlan, diffIssue, planIsEmpty, reconcile)
+import Myque.Github.Projection (ProjectionContext (..), projectIssue, renderDisplay)
+import Myque.Github.Reconcile (applyParentChange, buildPlan, diffIssue, planIsEmpty, reconcile)
 import Myque.Github.Source (decodeBlobBatch, withSnapshot)
 import Myque.Github.Types
 import Myque.Item (Kind (..), State (..), WorkItem (..), newWorkItem)
@@ -78,7 +78,7 @@ main = hspec $ do
         it "preserves human labels while replacing managed labels" $ do
             value <- fixtureUuid
             let desired = DesiredIssue value "A" "title" "body" IssueOpen Nothing (Set.fromList ["myque:state:open"])
-                actual = GithubIssue 1 "N" "bot" "body" "title" IssueOpen Nothing (Set.fromList ["human", "myque:state:done"]) "now" Nothing
+                actual = GithubIssue 1 1 "N" "bot" "body" "title" IssueOpen Nothing (Set.fromList ["human", "myque:state:done"]) "now" Nothing Nothing
             diffIssue desired actual `shouldBe` [RemoveLabel "myque:state:done", AddLabel "myque:state:open"]
     describe "projection planning" $ do
         it "creates only first-seen non-terminal items and keeps managed terminal items" $ do
@@ -98,6 +98,56 @@ main = hspec $ do
         it "rejects case-colliding managed tag labels before mutation" $ do
             snapshot <- fixtureSnapshotWithTags ["Foo", "foo"]
             buildPlan fixtureTarget snapshot (fixtureGithub Map.empty []) `shouldSatisfy` isLeft
+        it "creates terminal ancestors and plans native parent changes" $ do
+            snapshot <- fixtureSnapshotWithParent
+            parentId <- fixtureUuid
+            childId <- otherUuid
+            let parentItem = storeById (snapshotStore snapshot) Map.! parentId
+                childItem = storeById (snapshotStore snapshot) Map.! childId
+                parentIssue = fixtureIssue 7 parentId parentItem
+                childIssue = fixtureIssue 8 childId childItem
+                issues = Map.fromList [(parentId, parentIssue), (childId, childIssue)]
+            createPlan <- requireRight (buildPlan fixtureTarget snapshot (fixtureGithub Map.empty []))
+            Map.keys (planIssueCreates createPlan) `shouldMatchList` [parentId, childId]
+            planParentChanges createPlan `shouldBe` Map.singleton childId (renderDisplay snapshot childItem, Just parentId)
+            linkPlan <- requireRight (buildPlan fixtureTarget snapshot (fixtureGithub issues []))
+            planParentChanges linkPlan `shouldBe` Map.singleton childId (renderDisplay snapshot childItem, Just parentId)
+            childOnly <- requireRight (buildPlan fixtureTarget snapshot (fixtureGithub (Map.singleton childId childIssue) []))
+            planParentChanges childOnly `shouldBe` Map.singleton childId (renderDisplay snapshot childItem, Just parentId)
+            let linkedChild = childIssue{githubIssueParent = Just (GithubIssueRef "owner" "repo" 7)}
+            converged <- requireRight (buildPlan fixtureTarget snapshot (fixtureGithub (Map.insert childId linkedChild issues) []))
+            planParentChanges converged `shouldBe` Map.empty
+        it "plans removal and replacement of existing parents" $ do
+            snapshot <- fixtureSnapshotWithParent
+            parentId <- fixtureUuid
+            childId <- otherUuid
+            let parentItem = storeById (snapshotStore snapshot) Map.! parentId
+                childItem = storeById (snapshotStore snapshot) Map.! childId
+                parentIssue = fixtureIssue 7 parentId parentItem
+                childIssue = (fixtureIssue 8 childId childItem){githubIssueParent = Just (GithubIssueRef "owner" "repo" 99)}
+                issues = Map.fromList [(parentId, parentIssue), (childId, childIssue)]
+            replacePlan <- requireRight (buildPlan fixtureTarget snapshot (fixtureGithub issues []))
+            Map.lookup childId (planParentChanges replacePlan) `shouldBe` Just (renderDisplay snapshot childItem, Just parentId)
+            let detachedSnapshot = snapshotWithoutParent snapshot childId
+            removePlan <- requireRight (buildPlan fixtureTarget detachedSnapshot (fixtureGithub issues []))
+            Map.lookup childId (planParentChanges removePlan) `shouldBe` Just (renderDisplay detachedSnapshot childItem{itemParent = Nothing}, Nothing)
+        it "applies parent replacement with the child database id" $ do
+            parentId <- fixtureUuid
+            childId <- otherUuid
+            let parent = blankIssue 7 parentId
+                child = (blankIssue 8 childId){githubIssueId = 800, githubIssueParent = Just (GithubIssueRef "owner" "repo" 9)}
+                github = fixtureGithub (Map.fromList [(parentId, parent), (childId, child)]) []
+            calls <- newIORef []
+            let client = scriptedClient $ \_ args input -> do
+                    modifyIORef' calls (<> [(args, input)])
+                    pure (okIncluded Null)
+            applyParentChange client fixtureTarget github childId (Just parentId)
+            journal <- readIORef calls
+            case journal of
+                [(args, input)] -> do
+                    "/repos/owner/repo/issues/7/sub_issues" `shouldSatisfy` (`elem` args)
+                    input `shouldSatisfy` maybe False (\body -> B8.isInfixOf "\"sub_issue_id\":800" body && B8.isInfixOf "\"replace_parent\":true" body)
+                _ -> expectationFailure ("unexpected parent mutation calls: " <> show journal)
     describe "GitHub transport" $ do
         it "sends JSON writes through stdin and parses included responses" $ do
             let client = scriptedClient $ \_ args input -> do
@@ -129,6 +179,37 @@ main = hspec $ do
             planIsEmpty plan `shouldBe` True
             calls <- readIORef journal
             filter isWriteCall calls `shouldBe` []
+        it "converges when issue and label lists lag behind creates" $ withWriterSnapshot $ \spec snapshot -> do
+            value <- fixtureUuid
+            let item = storeById (snapshotStore snapshot) Map.! value
+                desired = projectIssue (ProjectionContext snapshot fixtureTarget (Map.singleton value 7)) item []
+                issue = issueFromDesired 7 desired
+            journal <- newIORef []
+            let client = scriptedClient $ \_ args _ -> do
+                    modifyIORef' journal (<> [args])
+                    pure (laggingResponse issue args)
+            plan <- reconcile client spec fixtureTarget snapshot
+            Map.keys (planIssueCreates plan) `shouldBe` [value]
+            calls <- readIORef journal
+            length (filter (\args -> isWriteCall args && any (isInfixOfArg "/issues") args) calls) `shouldBe` 1
+        it "stops parent mutation when the child identity changed" $ withParentWriterSnapshot $ \spec snapshot -> do
+            parentId <- fixtureUuid
+            childId <- otherUuid
+            let store = storeById (snapshotStore snapshot)
+                projection = ProjectionContext snapshot fixtureTarget (Map.fromList [(parentId, 7), (childId, 8)])
+                desiredFor uuid = projectIssue projection (store Map.! uuid) []
+                parentIssue = issueFromDesired 7 (desiredFor parentId)
+                childIssue = issueFromDesired 8 (desiredFor childId)
+                tampered = childIssue{githubIssueBody = "tampered"}
+                labels = Set.toAscList (Set.union (desiredLabels (desiredFor parentId)) (desiredLabels (desiredFor childId)))
+            journal <- newIORef []
+            let client = scriptedClient $ \_ args _ -> do
+                    modifyIORef' journal (<> [args])
+                    pure (parentWriterResponse [parentIssue, childIssue] labels tampered args)
+            result <- try (reconcile client spec fixtureTarget snapshot)
+            failureCodeOf result `shouldBe` Just 1
+            calls <- readIORef journal
+            filter (any (isInfixOfArg "/sub_issues")) calls `shouldBe` []
         it "stops before mutation when the source ref moves" $ withWriterSnapshot $ \spec snapshot -> do
             journal <- newIORef []
             moved <- newIORef False
@@ -219,7 +300,7 @@ fixtureGithub :: Map.Map Uuid GithubIssue -> [GithubLabel] -> GithubSnapshot
 fixtureGithub issues labels = GithubSnapshot (RepositoryMeta 1 "owner/repo" False True) (Map.elems issues) labels issues Map.empty []
 
 fixtureIssue :: Int -> Uuid -> WorkItem -> GithubIssue
-fixtureIssue number value item = GithubIssue number ("node" <> T.pack (show number)) "bot" (renderIssueIdentity value <> itemBody item) (itemTitleText item) IssueOpen Nothing Set.empty "now" Nothing
+fixtureIssue number value item = GithubIssue (fromIntegral number) number ("node" <> T.pack (show number)) "bot" (renderIssueIdentity value <> itemBody item) (itemTitleText item) IssueOpen Nothing Set.empty "now" Nothing Nothing
 
 itemTitleText :: WorkItem -> Text
 itemTitleText item = case T.lines (itemBody item) of
@@ -231,6 +312,29 @@ fixtureSnapshot = makeSnapshot []
 
 fixtureSnapshotWithTags :: [Text] -> IO Snapshot
 fixtureSnapshotWithTags = makeSnapshot
+
+fixtureSnapshotWithParent :: IO Snapshot
+fixtureSnapshotWithParent = withSystemTempDirectory "myque-gh-parent-fixture" $ \root -> do
+    layout <- initLayout root
+    created <- either fail pure (parseTimestamp "2026-08-20T06:21:00Z")
+    parentId <- fixtureUuid
+    childId <- otherUuid
+    let parentItem = (newWorkItem parentId Task created "terminal parent"){itemState = Done, itemClosed = Just created}
+        childItem = (newWorkItem childId Task created "open child"){itemParent = Just parentId}
+
+    mapM_ (saveItem layout) [parentItem, childItem]
+    git root ["init", "-q"]
+    git root ["add", "."]
+    gitEnv root ["commit", "-m", "fixture"]
+    withSnapshot (SourceSpec root "HEAD" Nothing Nothing Nothing) pure
+
+blankIssue :: Int -> Uuid -> GithubIssue
+blankIssue number value = GithubIssue (fromIntegral number) number ("node" <> T.pack (show number)) "bot" (renderIssueIdentity value) "" IssueOpen Nothing Set.empty "now" Nothing Nothing
+
+snapshotWithoutParent :: Snapshot -> Uuid -> Snapshot
+snapshotWithoutParent snapshot uuid = snapshot{snapshotStore = store{storeById = Map.adjust (\item -> item{itemParent = Nothing}) uuid (storeById store)}}
+  where
+    store = snapshotStore snapshot
 
 makeSnapshot :: [Text] -> IO Snapshot
 makeSnapshot tags = withSystemTempDirectory "myque-gh-snapshot-fixture" $ \root -> do
@@ -284,7 +388,8 @@ emptyPullRequests = object ["data" .= object ["repository" .= object ["pullReque
 issueValue :: GithubIssue -> Value
 issueValue issue =
     object
-        [ "number" .= githubIssueNumber issue
+        [ "id" .= githubIssueId issue
+        , "number" .= githubIssueNumber issue
         , "node_id" .= githubIssueNodeId issue
         , "user" .= object ["login" .= githubIssueAuthor issue]
         , "body" .= githubIssueBody issue
@@ -294,7 +399,11 @@ issueValue issue =
         , "labels" .= map (\name -> object ["name" .= name]) (Set.toAscList (githubIssueLabels issue))
         , "updated_at" .= githubIssueUpdatedAt issue
         , "html_url" .= githubIssueUrl issue
+        , "parent_issue_url" .= fmap issueRefUrl (githubIssueParent issue)
         ]
+
+issueRefUrl :: GithubIssueRef -> Text
+issueRefUrl reference = "https://api.github.com/repos/" <> githubIssueRefOwner reference <> "/" <> githubIssueRefRepo reference <> "/issues/" <> T.pack (show (githubIssueRefNumber reference))
 
 issueStateValue :: IssueState -> Text
 issueStateValue IssueOpen = "open"
@@ -310,6 +419,7 @@ labelValue name = object ["name" .= name, "color" .= ("ededed" :: Text), "descri
 issueFromDesired :: Int -> DesiredIssue -> GithubIssue
 issueFromDesired number desired =
     GithubIssue
+        (fromIntegral number)
         number
         ("node" <> T.pack (show number))
         "bot"
@@ -320,6 +430,7 @@ issueFromDesired number desired =
         (desiredLabels desired)
         "now"
         (Just ("https://github.com/owner/repo/issues/" <> T.pack (show number)))
+        Nothing
 
 withWriterSnapshot :: (SourceSpec -> Snapshot -> IO a) -> IO a
 withWriterSnapshot action = withSystemTempDirectory "myque-gh-writer" $ \root ->
@@ -333,6 +444,48 @@ withWriterSnapshot action = withSystemTempDirectory "myque-gh-writer" $ \root ->
         gitEnv root ["commit", "-m", "fixture"]
         let spec = SourceSpec root "refs/heads/main" Nothing Nothing Nothing
         withSnapshot spec (action spec)
+
+withParentWriterSnapshot :: (SourceSpec -> Snapshot -> IO a) -> IO a
+withParentWriterSnapshot action = withSystemTempDirectory "myque-gh-parent-writer" $ \root ->
+    withEnvironment "XDG_CACHE_HOME" (root </> "cache") $ do
+        layout <- initLayout root
+        created <- either fail pure (parseTimestamp "2026-08-20T06:21:00Z")
+        parentId <- fixtureUuid
+        childId <- otherUuid
+        let parentItem = newWorkItem parentId Task created "parent item"
+            childItem = (newWorkItem childId Task created "child item"){itemParent = Just parentId}
+        mapM_ (saveItem layout) [parentItem, childItem]
+        git root ["init", "-q", "--initial-branch=main"]
+        git root ["add", "."]
+        gitEnv root ["commit", "-m", "fixture"]
+        let spec = SourceSpec root "refs/heads/main" Nothing Nothing Nothing
+        withSnapshot spec (action spec)
+
+laggingResponse :: GithubIssue -> [String] -> CommandResult
+laggingResponse issue args
+    | isRepositoryGet args = okIncluded repositoryValue
+    | any (isInfixOfArg "/issues?state=all") args = jsonResult (Array mempty)
+    | any (isInfixOfArg "/labels?") args = jsonResult (Array mempty)
+    | "graphql" `elem` args = jsonResult emptyPullRequests
+    | isWriteCall args && any (isInfixOfArg "/labels") args = okIncluded Null
+    | isWriteCall args && any (isInfixOfArg "/issues") args = okIncluded (issueValue issue)
+    | any (isInfixOfArg "/issues/7") args = okIncluded (issueValue issue)
+    | otherwise = CommandResult (ExitFailure 1) "" "unexpected lagging writer call"
+
+parentWriterResponse :: [GithubIssue] -> [Text] -> GithubIssue -> [String] -> CommandResult
+parentWriterResponse issues labels tamperedChild args
+    | isRepositoryGet args = okIncluded repositoryValue
+    | any (isInfixOfArg "/issues?state=all") args = jsonResult (Array (foldMap (pure . issueValue) issues))
+    | any (isInfixOfArg "/labels?") args = jsonResult (Array (foldMap (pure . labelValue) labels))
+    | "graphql" `elem` args = jsonResult emptyPullRequests
+    | any (isInfixOfArg "/issues/8") args = okIncluded (issueValue tamperedChild)
+    | any (isInfixOfArg "/issues/7") args = maybe unexpected (okIncluded . issueValue) (lookupNumber 7)
+    | otherwise = unexpected
+  where
+    lookupNumber number = case filter ((== number) . githubIssueNumber) issues of
+        issue : _ -> Just issue
+        [] -> Nothing
+    unexpected = CommandResult (ExitFailure 1) "" "unexpected parent writer call"
 
 withEnvironment :: String -> String -> IO a -> IO a
 withEnvironment name value = bracket (lookupEnv name <* setEnv name value) restore . const

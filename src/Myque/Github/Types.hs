@@ -1,6 +1,6 @@
-{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE OverloadedStrings #-}
 
+-- | Shared values for canonical snapshots, GitHub observations, and reconciliation plans.
 module Myque.Github.Types (
     Target (..),
     SourceSpec (..),
@@ -10,6 +10,7 @@ module Myque.Github.Types (
     IssueState (..),
     CloseReason (..),
     GithubLabel (..),
+    GithubIssueRef (..),
     GithubIssue (..),
     RepositoryMeta (..),
     PrLifecycle (..),
@@ -31,7 +32,6 @@ import Data.ByteString (ByteString)
 import Data.Map.Strict (Map)
 import Data.Set (Set)
 import Data.Text (Text)
-import GHC.Generics (Generic)
 import Myque.Graph (Edges)
 import Myque.Render (Abbrev)
 import Myque.Store (Store)
@@ -75,24 +75,38 @@ data Failure = Failure
 
 instance Exception Failure
 
+-- | Convert a classified failure to its stable process exit code.
 failureExitCode :: Failure -> ExitCode
 failureExitCode failure = ExitFailure (failureCode failure)
 
+-- | Open or closed GitHub issue state.
 data IssueState = IssueOpen | IssueClosed
-    deriving (Eq, Ord, Show, Generic)
+    deriving (Eq, Ord, Show)
 
+-- | GitHub's semantic reason for a closed issue.
 data CloseReason = Completed | NotPlanned
-    deriving (Eq, Ord, Show, Generic)
+    deriving (Eq, Ord, Show)
 
+-- | GitHub label metadata used during discovery.
 data GithubLabel = GithubLabel
     { githubLabelName :: Text
     , githubLabelColor :: Text
     , githubLabelDescription :: Maybe Text
     }
-    deriving (Eq, Show, Generic)
+    deriving (Eq, Show)
 
+-- | Stable coordinates for an issue that may live in another repository.
+data GithubIssueRef = GithubIssueRef
+    { githubIssueRefOwner :: Text
+    , githubIssueRefRepo :: Text
+    , githubIssueRefNumber :: Int
+    }
+    deriving (Eq, Ord, Show)
+
+-- | Observed GitHub issue fields owned or consulted by reconciliation.
 data GithubIssue = GithubIssue
-    { githubIssueNumber :: Int
+    { githubIssueId :: Integer
+    , githubIssueNumber :: Int
     , githubIssueNodeId :: Text
     , githubIssueAuthor :: Text
     , githubIssueBody :: Text
@@ -102,26 +116,32 @@ data GithubIssue = GithubIssue
     , githubIssueLabels :: Set Text
     , githubIssueUpdatedAt :: Text
     , githubIssueUrl :: Maybe Text
+    , githubIssueParent :: Maybe GithubIssueRef
     }
-    deriving (Eq, Show, Generic)
+    deriving (Eq, Show)
 
+-- | Repository identity and issue availability used by mutation guards.
 data RepositoryMeta = RepositoryMeta
     { repositoryId :: Integer
     , repositoryNameWithOwner :: Text
     , repositoryArchived :: Bool
     , repositoryHasIssues :: Bool
     }
-    deriving (Eq, Show, Generic)
+    deriving (Eq, Show)
 
+-- | Lifecycle classification for a linked pull request.
 data PrLifecycle = PrOpen | PrMerged | PrClosedUnmerged
-    deriving (Eq, Ord, Show, Generic)
+    deriving (Eq, Ord, Show)
 
+-- | CI rollup observed for a linked pull request head.
 data CiState = CiPassing | CiFailing | CiPending | CiNone | CiUnknown
-    deriving (Eq, Ord, Show, Generic)
+    deriving (Eq, Ord, Show)
 
+-- | Review decision observed for a linked pull request head.
 data ReviewState = ReviewApproved | ReviewChangesRequested | ReviewRequired | ReviewNone | ReviewUnknown
-    deriving (Eq, Ord, Show, Generic)
+    deriving (Eq, Ord, Show)
 
+-- | A pull request linked to one canonical work item.
 data LinkedPr = LinkedPr
     { linkedPrNumber :: Int
     , linkedPrTitle :: Text
@@ -135,8 +155,9 @@ data LinkedPr = LinkedPr
     , linkedPrCi :: CiState
     , linkedPrReview :: ReviewState
     }
-    deriving (Eq, Show, Generic)
+    deriving (Eq, Show)
 
+-- | Complete GitHub observation used to construct a reconciliation plan.
 data GithubSnapshot = GithubSnapshot
     { githubRepository :: RepositoryMeta
     , githubIssues :: [GithubIssue]
@@ -147,6 +168,7 @@ data GithubSnapshot = GithubSnapshot
     }
     deriving (Eq, Show)
 
+-- | GitHub issue state desired for one canonical work item.
 data DesiredIssue = DesiredIssue
     { desiredUuid :: Uuid
     , desiredDisplay :: Text
@@ -158,6 +180,7 @@ data DesiredIssue = DesiredIssue
     }
     deriving (Eq, Show)
 
+-- | One mutable field difference on a managed GitHub issue.
 data IssueChange
     = SetTitle Text
     | SetBody Text
@@ -166,26 +189,31 @@ data IssueChange
     | RemoveLabel Text
     deriving (Eq, Show)
 
+-- | Configuration conflict that prevents a deterministic plan.
 data Conflict = Conflict
     { conflictCode :: Text
     , conflictDetail :: Text
     }
     deriving (Eq, Ord, Show)
 
+-- | Non-fatal observation reported with a plan.
 data Warning = Warning
     { warningCode :: Text
     , warningDetail :: Text
     }
     deriving (Eq, Ord, Show)
 
+-- | Ordered mutations required to converge GitHub on canonical state.
 data Plan = Plan
     { planLabelCreates :: [Text]
     , planIssueCreates :: Map Uuid DesiredIssue
     , planIssueChanges :: Map Int (Uuid, Text, [IssueChange])
+    , planParentChanges :: Map Uuid (Text, Maybe Uuid)
     , planWarnings :: [Warning]
     }
     deriving (Eq, Show)
 
+-- | Captured result of invoking GitHub CLI or Git.
 data CommandResult = CommandResult
     { commandExit :: ExitCode
     , commandStdout :: ByteString

@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 
+-- | GitHub CLI transport, REST discovery, and pull-request observations.
 module Myque.Github.Github (
     defaultGithubClient,
     discoverGithub,
@@ -52,6 +53,7 @@ import System.Process.Typed (
 apiHeaders :: [String]
 apiHeaders = ["-H", "Accept: application/vnd.github+json", "-H", "X-GitHub-Api-Version: 2026-03-10"]
 
+-- | Production GitHub CLI client with prompting, paging, and debug output disabled.
 defaultGithubClient :: GithubClient
 defaultGithubClient = GithubClient "gh" run
   where
@@ -69,11 +71,13 @@ sanitizeEnvironment environment =
     [("GH_PROMPT_DISABLED", "1"), ("GH_PAGER", "cat"), ("NO_COLOR", "1")]
         <> filter (\(name, _) -> name `notElem` ["GH_PROMPT_DISABLED", "GH_PAGER", "NO_COLOR", "GH_DEBUG"]) environment
 
+-- | Discover issues, labels, pull-request links, and optional head facts.
 discoverGithub :: GithubClient -> Target -> Snapshot -> IO GithubSnapshot
 discoverGithub client target snapshot = do
     core <- discoverCore client target snapshot
     enrichPullRequestFacts client target core
 
+-- | Discover repository, issue, label, and pull-request identity data without optional facts.
 discoverCore :: GithubClient -> Target -> Snapshot -> IO GithubSnapshot
 discoverCore client target snapshot = do
     repository <- getRepository client target
@@ -96,6 +100,7 @@ discoverCore client target snapshot = do
             , githubWarnings = issueWarnings <> prWarnings
             }
 
+-- | Read and validate target repository identity and issue availability.
 getRepository :: GithubClient -> Target -> IO RepositoryMeta
 getRepository client target = do
     (_, value) <- restSingle client "GET" (repoPath target) Nothing
@@ -106,11 +111,13 @@ getRepository client target = do
     unless (repositoryHasIssues repository) (remoteFailure 1 "target repository has Issues disabled")
     pure repository
 
+-- | Read one issue and all fields used by reconciliation.
 getIssue :: GithubClient -> Target -> Int -> IO GithubIssue
 getIssue client target number = do
     (_, value) <- restSingle client "GET" (repoPath target <> "/issues/" <> T.pack (show number)) Nothing
     decodeValue "issue" parseIssue value
 
+-- | Read a pull-request body and exact base repository name.
 getPullRequest :: GithubClient -> Target -> Int -> IO (Text, Text)
 getPullRequest client target number = do
     (_, value) <- restSingle client "GET" (repoPath target <> "/pulls/" <> T.pack (show number)) Nothing
@@ -121,6 +128,7 @@ getPullRequest client target number = do
         base <- row .: "base" >>= withObject "base" (.: "repo") >>= withObject "repo" (.: "full_name")
         pure (body, base)
 
+-- | Invoke a paginated REST endpoint and return its page values.
 restPaginated :: GithubClient -> Text -> IO [Value]
 restPaginated client endpoint = do
     result <- githubRunner client (githubExecutable client) (["api", "--hostname", "github.com", "--paginate", "--slurp", T.unpack endpoint] <> apiHeaders) Nothing
@@ -130,6 +138,7 @@ restPaginated client endpoint = do
         Array pages -> pure (foldr (:) [] pages)
         _ -> remoteFailure 3 "paginated REST response is not a JSON array of pages"
 
+-- | Invoke a paginated GraphQL query with target owner and repository variables.
 graphqlPaginated :: GithubClient -> Text -> Target -> IO [Value]
 graphqlPaginated client query target = do
     let args = ["api", "--hostname", "github.com", "graphql", "--paginate", "--slurp", "-f", "query=" <> T.unpack query, "-f", "owner=" <> T.unpack (targetOwner target), "-f", "name=" <> T.unpack (targetRepo target)]
@@ -140,6 +149,7 @@ graphqlPaginated client query target = do
         Array pages -> pure (foldr (:) [] pages)
         _ -> remoteFailure 3 "paginated GraphQL response is not a JSON array"
 
+-- | Invoke one REST request using JSON stdin and parse the included HTTP response.
 restSingle :: GithubClient -> Text -> Text -> Maybe Value -> IO (Int, Value)
 restSingle client method endpoint payload = do
     let args = ["api", "--hostname", "github.com", "--method", T.unpack method, "--include", T.unpack endpoint] <> apiHeaders <> maybe [] (const ["--input", "-"]) payload
@@ -202,6 +212,7 @@ parseRepository = withObject "repository" $ \row ->
         <*> row .: "archived"
         <*> row .: "has_issues"
 
+-- | Parse an issue returned by GitHub's REST API.
 parseIssue :: Value -> Parser GithubIssue
 parseIssue = withObject "issue" $ \row -> do
     when (KM.member "pull_request" row) (fail "pull request row")
@@ -211,17 +222,27 @@ parseIssue = withObject "issue" $ \row -> do
     state <- parseIssueState stateText'
     reason <- if state == IssueOpen then pure Nothing else traverse parseCloseReason reasonText
     author <- row .: "user" >>= withObject "user" (.: "login")
-    GithubIssue
-        <$> row .: "number"
-        <*> row .: "node_id"
-        <*> pure author
-        <*> (row .:? "body" .!= "")
-        <*> row .: "title"
-        <*> pure state
-        <*> pure reason
-        <*> pure (Set.fromList labels)
-        <*> row .: "updated_at"
-        <*> row .:? "html_url"
+    issueId <- row .: "id"
+    number <- row .: "number"
+    nodeId <- row .: "node_id"
+    body <- row .:? "body" .!= ""
+    title <- row .: "title"
+    updatedAt <- row .: "updated_at"
+    issueUrl <- row .:? "html_url"
+    parentUrl <- row .:? "parent_issue_url"
+    parent <- traverse parseIssueRef parentUrl
+    pure (GithubIssue issueId number nodeId author body title state reason (Set.fromList labels) updatedAt issueUrl parent)
+
+parseIssueRef :: Text -> Parser GithubIssueRef
+parseIssueRef raw = case reverse (T.splitOn "/" raw) of
+    numberText : "issues" : repo : owner : _ -> case decimal numberText of
+        Just number -> pure (GithubIssueRef (T.toCaseFold owner) (T.toCaseFold repo) number)
+        Nothing -> fail "parent issue URL has an invalid number"
+    _ -> fail "parent issue URL has an invalid shape"
+  where
+    decimal text = case reads (T.unpack text) of
+        [(number, "")] | number > 0 -> Just number
+        _ -> Nothing
 
 parseIssueState :: Text -> Parser IssueState
 parseIssueState "open" = pure IssueOpen
@@ -389,9 +410,11 @@ transportFailure result = remoteFailure 3 ("gh transport failed" <> suffix)
 remoteFailure :: Int -> Text -> IO a
 remoteFailure code message = throwIO Failure{failureCode = code, failureDiagnostic = message}
 
+-- | Build an escaped REST repository path for a target.
 repoPath :: Target -> Text
 repoPath target = "/repos/" <> encodePathSegment (targetOwner target) <> "/" <> encodePathSegment (targetRepo target)
 
+-- | Percent-encode one path segment without allowing separators through.
 encodePathSegment :: Text -> Text
 encodePathSegment = T.concatMap encodeChar
   where

@@ -11,7 +11,7 @@ import Myque.Item (Kind (..), State (..), WorkItem (..), newWorkItem)
 import Myque.Store (initLayout, saveItem)
 import Myque.Timestamp (Timestamp, parseTimestamp)
 import Myque.Uuid (Uuid, newUuidV7, uuidText)
-import System.Environment (getArgs, getEnvironment)
+import System.Environment (getArgs, getEnvironment, lookupEnv)
 import System.Exit (ExitCode (..), exitFailure)
 import System.IO.Temp (withSystemTempDirectory)
 import System.Process (CreateProcess (..), proc, readCreateProcessWithExitCode)
@@ -26,15 +26,16 @@ main = do
     unless (arguments == ["--repo", repo, "--allow-write"]) $ do
         putStrLn "refusing hosted mutations: require --repo mozufu/myque-gh --allow-write"
         exitFailure
-    outcome <- try runSmoke
+    author <- maybe "iceice666" id <$> lookupEnv "MYQUE_GH_ISSUE_AUTHOR"
+    outcome <- try (runSmoke author)
     case outcome of
         Right () -> pure ()
         Left failure -> do
             putStrLn ("hosted smoke failed: " <> show (failure :: SomeException))
             exitFailure
 
-runSmoke :: IO ()
-runSmoke = withSystemTempDirectory "myque-gh-hosted-smoke" $ \root -> withSystemTempDirectory "myque-gh-empty-cache" $ \freshCache -> do
+runSmoke :: String -> IO ()
+runSmoke author = withSystemTempDirectory "myque-gh-hosted-smoke" $ \root -> withSystemTempDirectory "myque-gh-empty-cache" $ \freshCache -> do
     layout <- initLayout root
     created <- timestamp "2026-08-20T14:21:00+08:00"
     closed <- timestamp "2026-08-26T19:42:00+08:00"
@@ -42,36 +43,38 @@ runSmoke = withSystemTempDirectory "myque-gh-hosted-smoke" $ \root -> withSystem
     secondUuid <- newUuidV7
     terminalUuid <- newUuidV7
     let first = newWorkItem firstUuid Task created "[myque-gh smoke] first"
-        second = newWorkItem secondUuid Bug created "[myque-gh smoke] second"
+        second = (newWorkItem secondUuid Bug created "[myque-gh smoke] second"){itemParent = Just firstUuid}
         terminal = (newWorkItem terminalUuid Task created "[myque-gh smoke] historical done"){itemState = Done, itemClosed = Just closed}
     mapM_ (saveItem layout) [first, second, terminal]
     _ <- git root ["init", "-q", "--initial-branch=main"]
     _ <- commit root "hosted smoke fixtures"
-    firstPlan <- successfulCli root (projectionArgs "plan" root)
+    firstPlan <- successfulCli root (projectionArgs author "plan" root)
     unless (uuidIn firstUuid firstPlan && uuidIn secondUuid firstPlan && not (uuidIn terminalUuid firstPlan)) (fail "plan did not select exactly the non-terminal smoke fixtures")
-    _ <- successfulCli root (projectionArgs "apply" root)
+    _ <- successfulCli root (projectionArgs author "apply" root)
     firstIssue <- discoverSmokeIssue firstUuid
     secondIssue <- discoverSmokeIssue secondUuid
     terminalIssue <- findSmokeIssue terminalUuid
     unless (terminalIssue == Nothing) (fail "first projection created a terminal-only smoke issue")
+    verifyParent firstIssue secondIssue
     ensureHumanLabel
     _ <- ghSilent ["api", "--hostname", "github.com", "--method", "POST", "/repos/" <> repo <> "/issues/" <> show firstIssue <> "/labels", "-f", "labels[]=smoke:human"]
     _ <- ghSilent ["api", "--hostname", "github.com", "--method", "POST", "/repos/" <> repo <> "/issues/" <> show firstIssue <> "/comments", "-f", "body=myque-gh smoke: preserve this comment"]
     _ <- ghSilent ["api", "--hostname", "github.com", "--method", "PATCH", "/repos/" <> repo <> "/issues/" <> show firstIssue, "-f", "title=[myque-gh smoke] manually drifted", "-f", "state=closed"]
-    _ <- successfulCliWithCache freshCache root (projectionArgs "apply" root)
-    noDrift <- successfulCliWithCache freshCache root (projectionArgs "plan" root)
+    _ <- successfulCliWithCache freshCache root (projectionArgs author "apply" root)
+    noDrift <- successfulCliWithCache freshCache root (projectionArgs author "plan" root)
     unless ("No changes." `isInfixOf` noDrift) (fail ("fresh-cache hosted projection did not converge:\n" <> noDrift))
     verifyHumanFacts firstIssue
-    mapM_ (saveItem layout) [cancel closed first, cancel closed second, terminal]
+    mapM_ (saveItem layout) [cancel closed first, (cancel closed second){itemParent = Nothing}, terminal]
     _ <- commit root "cancel hosted smoke fixtures"
-    _ <- successfulCli root (projectionArgs "apply" root)
+    _ <- successfulCli root (projectionArgs author "apply" root)
     verifyCancelled firstIssue
     verifyCancelled secondIssue
+    verifyNoParent secondIssue
     putStrLn (T.unpack (uuidText firstUuid) <> " -> https://github.com/" <> repo <> "/issues/" <> show firstIssue)
     putStrLn (T.unpack (uuidText secondUuid) <> " -> https://github.com/" <> repo <> "/issues/" <> show secondIssue)
 
-projectionArgs :: String -> FilePath -> [String]
-projectionArgs command root =
+projectionArgs :: String -> String -> FilePath -> [String]
+projectionArgs author command root =
     [ command
     , "--store"
     , root
@@ -80,7 +83,7 @@ projectionArgs command root =
     , "--ref"
     , "refs/heads/main"
     , "--issue-author"
-    , "iceice666"
+    , author
     ]
 
 cancel :: Timestamp -> WorkItem -> WorkItem
@@ -149,6 +152,16 @@ verifyHumanFacts issue = do
     unless (trim labelPresent == "true") (fail "human label was not preserved")
     commentPresent <- gh ["api", "--hostname", "github.com", "/repos/" <> repo <> "/issues/" <> show issue <> "/comments", "--jq", "map(.body == \"myque-gh smoke: preserve this comment\") | any"]
     unless (trim commentPresent == "true") (fail "human comment was not preserved")
+
+verifyParent :: Int -> Int -> IO ()
+verifyParent parent child = do
+    actual <- gh ["api", "--hostname", "github.com", "/repos/" <> repo <> "/issues/" <> show child <> "/parent", "--jq", ".number"]
+    unless (trim actual == show parent) (fail "smoke child was not attached to its canonical parent")
+
+verifyNoParent :: Int -> IO ()
+verifyNoParent child = do
+    (exitCode, _out, _err) <- readCreateProcessWithExitCode (proc "gh" ["api", "--hostname", "github.com", "/repos/" <> repo <> "/issues/" <> show child <> "/parent"]) ""
+    unless (exitCode == ExitFailure 1) (fail "smoke child parent was not removed")
 
 verifyCancelled :: Int -> IO ()
 verifyCancelled issue = do
