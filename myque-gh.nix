@@ -39,9 +39,28 @@ mkDerivation {
     text
     typed-process
   ];
-  testHaskellDepends = [ aeson base bytestring containers directory filepath hspec myque process temporary text ];
+  testHaskellDepends = [
+    aeson
+    base
+    bytestring
+    containers
+    directory
+    filepath
+    hspec
+    myque
+    process
+    temporary
+    text
+  ];
   testToolDepends = [ git ];
-  executableHaskellDepends = [ base containers myque process temporary text ];
+  executableHaskellDepends = [
+    base
+    containers
+    myque
+    process
+    temporary
+    text
+  ];
   description = "Project canonical myque work items into GitHub";
   license = lib.licenses.bsd3;
   mainProgram = "myque-gh";

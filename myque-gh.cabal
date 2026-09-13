@@ -73,7 +73,6 @@ executable myque-gh-hosted-smoke
   main-is:          HostedSmoke.hs
   hs-source-dirs:   test
   default-language: GHC2021
-  scope:            private
   build-tool-depends: myque-gh:myque-gh
   build-depends:
     , base
