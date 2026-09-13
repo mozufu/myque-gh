@@ -43,4 +43,4 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.MYQUE_GH_SMOKE_TOKEN }}
           GH_REPO: mozufu/myque-gh-smoke
-          MYQUE_GH_ISSUE_AUTHOR: github-actions[bot]
+          MYQUE_GH_ISSUE_AUTHOR: iceice666
