@@ -11,6 +11,7 @@ import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
+import Myque.Github.Body (BodyRenderer (..), prepareBodies)
 import Myque.Github.Github
 import Myque.Github.Markers
 import Myque.Github.Reconcile
@@ -37,6 +38,8 @@ data Common = Common
     , commonSourceRepo :: Maybe String
     , commonSourceBranch :: Maybe String
     , commonProject :: String
+    , commonBodyRenderer :: Maybe FilePath
+    , commonBodyRendererArgs :: [String]
     }
 
 data PrLink = PrLink
@@ -78,7 +81,12 @@ runProjection applying common = do
     target <- parseTarget (commonRepo common) (commonAuthors common) True
     source <- parseSource common applying
     query <- either (config . T.pack) pure (parseQuery (T.pack (commonProject common)))
-    withSnapshot source $ \snapshot -> do
+    renderer <- case commonBodyRenderer common of
+        Nothing | not (null (commonBodyRendererArgs common)) -> usage "--body-renderer-arg requires --body-renderer"
+        Nothing -> pure Nothing
+        Just executable -> pure (Just (BodyRenderer executable (commonBodyRendererArgs common)))
+    withSnapshot source $ \rawSnapshot -> do
+        snapshot <- prepareBodies renderer rawSnapshot
         selected <- either config pure (selectProjection query snapshot)
         if applying
             then do
@@ -197,6 +205,8 @@ commonParser applying =
         <*> optional (strOption (long "source-repo" <> metavar "OWNER/REPO" <> help "Repository used only for canonical hyperlinks"))
         <*> optional (strOption (long "source-branch" <> metavar "BRANCH" <> help "Branch used only for canonical hyperlinks"))
         <*> strOption (long "project" <> metavar "QUERY" <> value (T.unpack defaultProjectionQuery) <> showDefault <> help "Myque query selecting first-time projections; trusted existing issues/milestones and required parents are retained")
+        <*> optional (strOption (long "body-renderer" <> metavar "EXECUTABLE" <> help "Trusted Markdown renderer; receives MyQue api-get JSON on stdin, never a shell command"))
+        <*> many (strOption (long "body-renderer-arg" <> metavar "ARG" <> help "Literal renderer argument; repeat in argument order (devloop: render)"))
 
 prLinkParser :: Parser PrLink
 prLinkParser =

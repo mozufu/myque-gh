@@ -61,11 +61,14 @@ data SourceSpec = SourceSpec
 -- | Validated canonical state loaded from one commit.
 data Snapshot = Snapshot
     { snapshotSha :: Text
+    , snapshotRepository :: Text
+    -- ^ The store repository's MyQue identity, for checking retained history.
     , snapshotSource :: SourceSpec
     , snapshotStore :: Store
     , snapshotEdges :: Edges
     , snapshotAbbrev :: Abbrev
     , snapshotSourcePaths :: Map Uuid FilePath
+    , snapshotRenderedBodies :: Map Uuid Text
     }
 
 -- | A stable CLI failure classification and diagnostic.

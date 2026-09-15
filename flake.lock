@@ -7,17 +7,17 @@
         ]
       },
       "locked": {
-        "lastModified": 1788658951,
-        "narHash": "sha256-9HVaPCwp7CZbHtwZmeZg9ywb9miK/tgzglNUcCj8Qww=",
+        "lastModified": 1789494003,
+        "narHash": "sha256-j552MCvxi6WeV3aMaXkSHimo3O7vnbdMbeOOZ5bqXOY=",
         "owner": "mozufu",
         "repo": "myque",
-        "rev": "b37ce24c6541d7bf3581e890b5df29c782701cd5",
+        "rev": "d25241fcbf1d6b1e06283717c246576e88f6fa5d",
         "type": "github"
       },
       "original": {
         "owner": "mozufu",
         "repo": "myque",
-        "rev": "b37ce24c6541d7bf3581e890b5df29c782701cd5",
+        "rev": "d25241fcbf1d6b1e06283717c246576e88f6fa5d",
         "type": "github"
       }
     },

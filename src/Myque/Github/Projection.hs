@@ -18,6 +18,7 @@ import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
+import Myque.Github.Body (projectionBody)
 import Myque.Github.Github (encodePathSegment)
 import Myque.Github.Markers (renderIssueIdentity, renderMilestoneIdentity)
 import Myque.Github.Types
@@ -32,7 +33,7 @@ import Myque.Item (
     stateText,
  )
 import Myque.Render (label)
-import Myque.Store (Store (..))
+import Myque.Store (History (..), Store (..), TerminalRecord (..))
 import Myque.Uuid (Uuid, uuidText)
 
 -- | Immutable context needed to render links and relationship displays.
@@ -77,7 +78,7 @@ projectMilestone context item =
                 <> "\n\n**Myque state:** "
                 <> stateText (itemState item)
                 <> "\n\nGitHub progress counts closed issues; it is not myque completion evidence.\n"
-                <> itemBody item
+                <> projectionBody (projectionSnapshot context) item
         , desiredMilestoneState = if isTerminal (itemState item) then IssueClosed else IssueOpen
         }
 
@@ -132,7 +133,7 @@ renderBody context item linkedPrs =
         <> "\n## Implementation\n"
         <> renderPullRequests context linkedPrs
         <> "\n---\n"
-        <> itemBody item
+        <> projectionBody snapshot item
   where
     snapshot = projectionSnapshot context
     store = snapshotStore snapshot
@@ -148,10 +149,23 @@ renderTags [] = "none"
 renderTags tags = T.intercalate ", " ["<code>" <> html tag <> "</code>" | tag <- sort tags]
 
 renderCanonical :: ProjectionContext -> WorkItem -> Text
-renderCanonical context item = case (sourceLinkRepo spec, sourceLinkBranch spec) of
-    (Just (owner, repo), Just branch) ->
-        "[" <> markdown path <> "](https://github.com/" <> encodePathSegment owner <> "/" <> encodePathSegment repo <> "/blob/" <> encodePathSegment branch <> "/" <> encodePath path <> ")"
-    _ -> markdown path <> " — <code>" <> html (uuidText (itemId item)) <> "</code>"
+renderCanonical context item = case Map.lookup (itemId item) (storeTerminals (snapshotStore snapshot)) of
+    Just terminal ->
+        let history = terminalHistory terminal
+            historicalPath = historyPath history
+            reference = historyCommit history <> ":" <> historicalPath
+            -- A retained commit only exists in the repository whose identity
+            -- recorded it; MyQue's own retrieval refuses any other lineage.
+            location = case sourceLinkRepo spec of
+                Just (owner, repo)
+                    | historyRepository history == snapshotRepository snapshot ->
+                        "[" <> markdown reference <> "](https://github.com/" <> encodePathSegment owner <> "/" <> encodePathSegment repo <> "/blob/" <> encodePathSegment (historyCommit history) <> "/" <> encodePath historicalPath <> ")"
+                _ -> "<code>" <> html reference <> "</code>"
+         in location <> " — retained repository: <code>" <> html (historyRepository history) <> "</code>; exact-byte SHA-256: <code>" <> html (historyDigest history) <> "</code>"
+    Nothing -> case (sourceLinkRepo spec, sourceLinkBranch spec) of
+        (Just (owner, repo), Just branch) ->
+            "[" <> markdown path <> "](https://github.com/" <> encodePathSegment owner <> "/" <> encodePathSegment repo <> "/blob/" <> encodePathSegment branch <> "/" <> encodePath path <> ")"
+        _ -> markdown path <> " — <code>" <> html (uuidText (itemId item)) <> "</code>"
   where
     snapshot = projectionSnapshot context
     spec = snapshotSource snapshot
@@ -182,12 +196,7 @@ renderRelation context uuid = case Map.lookup uuid (storeById store) of
     snapshot = projectionSnapshot context
     store = snapshotStore snapshot
     target = projectionTarget context
-    fallback related = case (sourceLinkRepo spec, sourceLinkBranch spec) of
-        (Just (owner, repo), Just branch) ->
-            let path = T.pack (Map.findWithDefault (".tasks/items/" <> T.unpack (uuidText uuid) <> ".md") uuid (snapshotSourcePaths snapshot))
-             in "[" <> markdown path <> "](https://github.com/" <> encodePathSegment owner <> "/" <> encodePathSegment repo <> "/blob/" <> encodePathSegment branch <> "/" <> encodePath path <> ")"
-        _ -> "<code>" <> html (uuidText (itemId related)) <> "</code>"
-    spec = snapshotSource snapshot
+    fallback = renderCanonical context
 
 renderPullRequests :: ProjectionContext -> [LinkedPr] -> Text
 renderPullRequests _ [] = "No linked pull requests.\n"

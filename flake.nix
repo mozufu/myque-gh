@@ -5,7 +5,7 @@
     # 26.05 is the final nixpkgs release supporting x86_64-darwin.
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     myque = {
-      url = "github:mozufu/myque/b37ce24c6541d7bf3581e890b5df29c782701cd5";
+      url = "github:mozufu/myque/d25241fcbf1d6b1e06283717c246576e88f6fa5d";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };

@@ -13,6 +13,7 @@ import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
+import Myque.Github.Body (BodyRenderer (..), prepareBodies, validateProjectionBodies)
 import Myque.Github.Cli (runCli)
 import Myque.Github.Github (discoverGithub, encodePathSegment, getRepository, graphqlPaginated, restSingle)
 import Myque.Github.Markers
@@ -20,11 +21,13 @@ import Myque.Github.Projection (ProjectionContext (..), projectIssue, projectMil
 import Myque.Github.Reconcile (applyIssueDiff, applyParentChange, buildPlan, defaultProjectionQuery, diffIssue, planIsEmpty, reconcile, selectProjection)
 import Myque.Github.Source (decodeBlobBatch, withSnapshot)
 import Myque.Github.Types
+import Myque.Graph (edgesOf, isReady)
 import Myque.Item (Kind (..), State (..), WorkItem (..), newWorkItem)
 import Myque.Query (parseQuery)
-import Myque.Store (Store (..), initLayout, saveItem, storeItems)
+import Myque.Store (History (..), Store (..), TerminalRecord (..), initLayout, saveItem, storeItems)
+import Myque.Terminal (encodeTerminal)
 import Myque.Timestamp (parseTimestamp)
-import Myque.Uuid (Uuid, parseUuid)
+import Myque.Uuid (Uuid, parseUuid, uuidText)
 import System.Directory (createDirectoryIfMissing)
 import System.Environment (lookupEnv, setEnv, unsetEnv)
 import System.Exit (ExitCode (..))
@@ -35,6 +38,144 @@ import Test.Hspec
 
 main :: IO ()
 main = hspec $ do
+    describe "consumer Markdown rendering" $ do
+        it "preserves legacy Markdown byte-for-byte without a renderer" $ do
+            original <- fixtureSnapshot
+            uuid <- fixtureUuid
+            let prose = "# open item\n\nLegacy prose.\r\n\n```zt\nvalue ::= 64;\nvalue\n```\n\n````markdown\n```zti\n{ example = true; }\n```\n````\n"
+                snapshot = adjustSnapshotItem uuid (\item -> item{itemBody = prose}) original
+            prepared <- prepareBodies Nothing snapshot
+            let item = storeById (snapshotStore prepared) Map.! uuid
+                desired = projectIssue (ProjectionContext prepared fixtureTarget Map.empty) item []
+            desiredBody desired `shouldSatisfy` T.isSuffixOf prose
+            desiredUuid desired `shouldBe` uuid
+        it "renders human Markdown while retaining UUID markers and PR identity" $ do
+            original <- fixtureSnapshot
+            uuid <- fixtureUuid
+            let snapshot = adjustSnapshotItem uuid (\item -> item{itemBody = "# open item\n\n```zti\n{ problem = \"bounded queue\"; }\n```\n"}) original
+                readable = "## Problem\nBounded queue\n\n## Acceptance\n- A1: Reject overload.\n"
+            prepared <- prepareBodies (Just (BodyRenderer "printf" [T.unpack readable])) snapshot
+            let item = storeById (snapshotStore prepared) Map.! uuid
+                desired = projectIssue (ProjectionContext prepared fixtureTarget Map.empty) item []
+            desiredBody desired `shouldSatisfy` T.isSuffixOf readable
+            desiredBody desired `shouldSatisfy` (not . T.isInfixOf "```zti")
+            parseIssueIdentity (desiredBody desired) `shouldBe` Right (Just uuid)
+            parsedPrUuids (parsePrLinks (trailer [uuid])) `shouldBe` Set.singleton uuid
+        it "refuses unrendered structured fences and a renderer that returns raw data" $ do
+            original <- fixtureSnapshot
+            uuid <- fixtureUuid
+            let raw = "```zti\n{ problem = \"queue\"; }\n```\n"
+                snapshot = adjustSnapshotItem uuid (\item -> item{itemBody = raw}) original
+            validateProjectionBodies snapshot `shouldSatisfy` isLeft
+            unconfigured <- try (prepareBodies Nothing snapshot)
+            failureCodeOf unconfigured `shouldBe` Just 1
+            unsafe <- try (prepareBodies (Just (BodyRenderer "printf" [T.unpack raw])) snapshot)
+            failureCodeOf unsafe `shouldBe` Just 1
+            buildPlan Set.empty fixtureTarget snapshot (fixtureGithub Map.empty []) `shouldSatisfy` isLeft
+        it "refuses every structured body the projection would actually emit" $ do
+            original <- fixtureSnapshot
+            uuid <- fixtureUuid
+            let bodies =
+                    [ "```zt\nvalue ::= 64;\n```\n"
+                    , "```zt\nvalue ::= 64;\n```\n\n# Notes\n\nprose\n"
+                    , "# open item\n\n```zt profile=requirements\nvalue ::= 64;\n```\n"
+                    , "# open item\n\n~~~zti lang=x\n{ problem = \"queue\"; }\n~~~\n"
+                    ]
+            mapM_
+                ( \body -> do
+                    let snapshot = adjustSnapshotItem uuid (\item -> item{itemBody = body}) original
+                    validateProjectionBodies snapshot `shouldSatisfy` isLeft
+                    unconfigured <- try (prepareBodies Nothing snapshot)
+                    failureCodeOf unconfigured `shouldBe` Just 1
+                    buildPlan Set.empty fixtureTarget snapshot (fixtureGithub Map.empty []) `shouldSatisfy` isLeft
+                )
+                bodies
+        it "keeps a heading-less description instead of silently dropping it" $ do
+            original <- fixtureSnapshot
+            uuid <- fixtureUuid
+            let prose = "Required description without any heading.\n"
+                snapshot = adjustSnapshotItem uuid (\item -> item{itemBody = prose}) original
+            prepared <- prepareBodies Nothing snapshot
+            let item = storeById (snapshotStore prepared) Map.! uuid
+            desiredBody (projectIssue (ProjectionContext prepared fixtureTarget Map.empty) item []) `shouldSatisfy` T.isSuffixOf prose
+            empty <- try (prepareBodies (Just (BodyRenderer "printf" [""])) snapshot)
+            failureCodeOf empty `shouldBe` Just 1
+        it "refuses failed, missing, empty and non-UTF8 renderers without fallback" $ do
+            original <- fixtureSnapshot
+            uuid <- fixtureUuid
+            let snapshot = adjustSnapshotItem uuid (\item -> item{itemBody = "# item\n\nRequired description\n"}) original
+            mapM_
+                ( \renderer -> do
+                    result <- try (prepareBodies (Just renderer) snapshot)
+                    failureCodeOf result `shouldBe` Just 1
+                )
+                [ BodyRenderer "false" []
+                , BodyRenderer "/nonexistent/myque-gh-renderer" []
+                , BodyRenderer "printf" [""]
+                , BodyRenderer "printf" ["\\377"]
+                , BodyRenderer "printf" ["<!-- myque:id=spoof -->"]
+                ]
+        it "passes literal argument vectors rather than a shell command" $ do
+            snapshot <- fixtureSnapshot
+            uuid <- fixtureUuid
+            let literal = "$(exit 73); `exit 72`"
+            prepared <- prepareBodies (Just (BodyRenderer "printf" ["%s", literal])) snapshot
+            Map.lookup uuid (snapshotRenderedBodies prepared) `shouldBe` Just (T.pack literal)
+    describe "retired identity projection" $ do
+        it "resolves retired dependencies offline with done-only readiness" $ do
+            snapshot <- fixtureSnapshot
+            dependentId <- fixtureUuid
+            dependencyId <- otherUuid
+            let original = snapshotStore snapshot
+                dependent = (storeById original Map.! dependentId){itemDepends = [dependencyId]}
+                dependency = storeById original Map.! dependencyId
+                history = History (T.replicate 40 "c") (T.replicate 40 "a") (canonicalRetiredPath dependencyId) (T.replicate 64 "b")
+            mapM_
+                ( \(state, ready) -> do
+                    let terminalItemValue = dependency{itemState = state}
+                        store = original{storeById = Map.fromList [(dependentId, dependent), (dependencyId, terminalItemValue)], storeTerminals = Map.singleton dependencyId (TerminalRecord terminalItemValue history "reason" (canonicalRetiredPath dependencyId))}
+                    isReady store (edgesOf store) dependent `shouldBe` ready
+                )
+                [(Done, True), (Cancelled, False)]
+        it "keeps done/cancelled reasons, immutable recovery links and reopening identity" $ do
+            original <- fixtureSnapshot
+            uuid <- fixtureUuid
+            let active = storeById (snapshotStore original) Map.! uuid
+                history = History (snapshotRepository original) (T.replicate 40 "a") (canonicalRetiredPath uuid) (T.replicate 64 "b")
+                source = (snapshotSource original){sourceLinkRepo = Just ("owner", "repo"), sourceLinkBranch = Just "main"}
+            mapM_
+                ( \(state, reason) -> do
+                    let item = active{itemState = state}
+                        store = snapshotStore original
+                        terminal = TerminalRecord item history "Verified closure or cancellation" (canonicalRetiredPath uuid)
+                        retired = original{snapshotSource = source, snapshotStore = store{storeById = Map.insert uuid item (storeById store), storeTerminals = Map.singleton uuid terminal}}
+                        desired = projectIssue (ProjectionContext retired fixtureTarget Map.empty) item []
+                    desiredState desired `shouldBe` IssueClosed
+                    desiredReason desired `shouldBe` Just reason
+                    parseIssueIdentity (desiredBody desired) `shouldBe` Right (Just uuid)
+                    desiredBody desired `shouldSatisfy` T.isInfixOf ("/blob/" <> T.replicate 40 "a" <> "/" <> canonicalRetiredPath uuid)
+                    desiredBody desired `shouldSatisfy` T.isInfixOf "not available offline"
+                    let reopened = projectIssue (ProjectionContext original fixtureTarget Map.empty) active []
+                    desiredUuid reopened `shouldBe` desiredUuid desired
+                    desiredState reopened `shouldBe` IssueOpen
+                    desiredReason reopened `shouldBe` Nothing
+                )
+                [(Done, Completed), (Cancelled, NotPlanned)]
+        it "never links retained history that belongs to another repository" $ do
+            original <- fixtureSnapshot
+            uuid <- fixtureUuid
+            let active = storeById (snapshotStore original) Map.! uuid
+                item = active{itemState = Done}
+                store = snapshotStore original
+                foreign' = History (T.replicate 40 "c") (T.replicate 40 "a") (canonicalRetiredPath uuid) (T.replicate 64 "b")
+                source = (snapshotSource original){sourceLinkRepo = Just ("owner", "repo"), sourceLinkBranch = Just "main"}
+                retired = original{snapshotSource = source, snapshotStore = store{storeById = Map.insert uuid item (storeById store), storeTerminals = Map.singleton uuid (TerminalRecord item foreign' "Verified closure" (canonicalRetiredPath uuid))}}
+                desired = projectIssue (ProjectionContext retired fixtureTarget Map.empty) item []
+            desiredBody desired `shouldSatisfy` (not . T.isInfixOf "/blob/")
+            desiredBody desired `shouldSatisfy` T.isInfixOf (T.replicate 40 "a" <> ":" <> canonicalRetiredPath uuid)
+            case buildPlan Set.empty fixtureTarget retired (fixtureGithub Map.empty []) of
+                Left conflicts -> expectationFailure ("unexpected conflicts: " <> show conflicts)
+                Right plan -> map warningCode (planWarnings plan) `shouldBe` ["foreign-retained-history"]
     describe "decodeBlobBatch" $ do
         it "decodes exact framed blobs" $ do
             let oid = T.replicate 40 "a"
@@ -511,6 +652,43 @@ main = hspec $ do
             map linkedPrCi (githubPrsByUuid github Map.! first) `shouldBe` [CiUnknown]
             map linkedPrReview (githubPrsByUuid github Map.! first) `shouldBe` [ReviewUnknown]
     describe "committed snapshots" $ do
+        it "projects a migrated v2 envelope without interpreting consumer records" $ withSystemTempDirectory "myque-gh-v2-source" $ \root -> do
+            initializeRepo root
+            let path = root </> ".tasks" </> "items" </> "019a10d8-8d48-7b77-a414-f95ab7af31be.md"
+            writeFile path itemOne
+            git root ["add", "."]
+            gitEnv root ["commit", "-m", "legacy"]
+            before <- withSnapshot (SourceSpec root "HEAD" Nothing Nothing Nothing) pure
+            let migrated = T.replace "schema: work-item/v1" "schema: work-item/v2\nexample:\n  opaque: retained" (T.pack itemOne)
+            writeFile path (T.unpack migrated)
+            git root ["add", "."]
+            gitEnv root ["commit", "-m", "envelope migration"]
+            withSnapshot (SourceSpec root "HEAD" Nothing Nothing Nothing) $ \after -> do
+                let project snapshot = [projectIssue (ProjectionContext snapshot fixtureTarget Map.empty) item [] | item <- storeItems (snapshotStore snapshot)]
+                map desiredUuid (project after) `shouldBe` map desiredUuid (project before)
+                map desiredBody (project after) `shouldBe` map desiredBody (project before)
+        it "loads terminal-only commits offline and ignores working-tree corruption" $ withSystemTempDirectory "myque-gh-terminal-source" $ \root -> do
+            _ <- initLayout root
+            uuid <- fixtureUuid
+            created <- either fail pure (parseTimestamp "2026-08-20T06:21:00Z")
+            closed <- either fail pure (parseTimestamp "2026-08-26T06:21:00Z")
+            let item = (newWorkItem uuid Task created "retired task"){itemState = Done, itemClosed = Just closed}
+                path = root </> ".tasks" </> "terminal" </> T.unpack (T.pack (show uuid)) <> ".json"
+                history = History (T.replicate 40 "c") (T.replicate 40 "a") (canonicalRetiredPath uuid) (T.replicate 64 "b")
+            createDirectoryIfMissing True (root </> ".tasks" </> "terminal")
+            writeFile path (T.unpack (encodeTerminal (TerminalRecord item history "verified" (canonicalRetiredPath uuid))))
+            git root ["init", "-q"]
+            git root ["add", "."]
+            gitEnv root ["commit", "-m", "terminal fixture"]
+            writeFile path "corrupt working tree"
+            withSnapshot (SourceSpec root "HEAD" Nothing Nothing Nothing) $ \snapshot -> do
+                let store = snapshotStore snapshot
+                Map.lookup uuid (storeTerminals store) `shouldSatisfy` maybe False ((== history) . terminalHistory)
+                fmap itemState (Map.lookup uuid (storeById store)) `shouldBe` Just Done
+                github <- discoverGithub (discoveryClient [corePr 1 "OPEN" False (Just "fork/repo") (trailer [uuid])] (factsResponse [])) fixtureTarget snapshot
+                Map.member uuid (githubPrsByUuid github) `shouldBe` True
+                prepared <- prepareBodies (Just (BodyRenderer "false" [])) snapshot
+                snapshotRenderedBodies prepared `shouldBe` Map.empty
         it "reads committed content instead of working-tree edits" $ withSystemTempDirectory "myque-gh-source" $ \root -> do
             initializeRepo root
             let itemPath = root </> ".tasks" </> "items" </> "019a10d8-8d48-7b77-a414-f95ab7af31be.md"
@@ -898,6 +1076,9 @@ corePr number state draft headRepo body =
 
 factsResponse :: [(Int, Text, Maybe Text, Maybe Text)] -> Value
 factsResponse values = object ["data" .= object ["repository" .= object [(Key.fromText (T.pack ("p" <> show number)), object ["headRefOid" .= sha, "statusCheckRollup" .= fmap (\state -> object ["state" .= state]) ci, "reviewDecision" .= review]) | (number, sha, ci, review) <- values]]]
+
+canonicalRetiredPath :: Uuid -> Text
+canonicalRetiredPath value = ".tasks/items/" <> uuidText value <> ".md"
 
 trailer :: [Uuid] -> Text
 trailer values = T.unlines (["<!-- myque:pr-links=github/v1 -->"] <> map (\value -> "<!-- myque:implements=" <> T.pack (show value) <> " -->") values <> ["<!-- myque:pr-links:end -->"])

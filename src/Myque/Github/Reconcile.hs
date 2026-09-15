@@ -24,6 +24,7 @@ import Data.Maybe (isJust, isNothing)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
+import Myque.Github.Body (validateProjectionBodies)
 import Myque.Github.Github (
     discoverGithub,
     encodePathSegment,
@@ -41,7 +42,7 @@ import Myque.Github.Source (resolveSourceRef)
 import Myque.Github.Types
 import Myque.Item (Kind (Milestone), WorkItem (..), isTerminal)
 import Myque.Query (Query, runQuery)
-import Myque.Store (Store (..))
+import Myque.Store (History (..), Store (..), TerminalRecord (..))
 import Myque.Uuid (Uuid, uuidText)
 import System.Directory (XdgDirectory (XdgCache), createDirectoryIfMissing, getXdgDirectory)
 import System.FileLock (SharedExclusive (Exclusive), tryLockFile, unlockFile)
@@ -60,6 +61,7 @@ selectProjection query snapshot =
 -- | Construct the complete deterministic convergence plan.
 buildPlan :: Set.Set Uuid -> Target -> Snapshot -> GithubSnapshot -> Either [Conflict] Plan
 buildPlan querySelected target snapshot github = do
+    either (Left . pure . Conflict "body-rendering") Right (validateProjectionBodies snapshot)
     let
         retained =
             Map.keysSet (Map.intersection canonical (githubIssueByUuid github))
@@ -103,6 +105,11 @@ buildPlan querySelected target snapshot github = do
             | (uuid, milestone) <- Map.toAscList (githubMilestoneByUuid github)
             , maybe True ((/= Milestone) . itemKind) (Map.lookup uuid canonical)
             ]
+        historyWarnings =
+            [ Warning "foreign-retained-history" ("retired " <> uuidText uuid <> " records repository " <> historyRepository (terminalHistory terminal) <> ", not this store's " <> snapshotRepository snapshot <> "; history links are shown as text and cannot be retrieved here")
+            | (uuid, terminal) <- Map.toAscList (storeTerminals store)
+            , historyRepository (terminalHistory terminal) /= snapshotRepository snapshot
+            ]
     milestoneTitleCheck desiredMilestones github
     assignments <-
         traverse
@@ -118,7 +125,7 @@ buildPlan querySelected target snapshot github = do
             , planIssueCreates = creates
             , planIssueChanges = changes
             , planParentChanges = parentChanges
-            , planWarnings = githubWarnings github <> orphanWarnings <> milestoneWarnings
+            , planWarnings = githubWarnings github <> orphanWarnings <> milestoneWarnings <> historyWarnings
             , planMilestoneCreates = milestoneCreates
             , planMilestoneChanges = milestoneChanges
             , planMilestoneAssignments = Map.fromList [(uuid, assignment) | (uuid, assignment, True) <- assignments]

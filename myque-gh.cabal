@@ -1,12 +1,13 @@
 cabal-version:   3.0
 name:            myque-gh
-version:         0.1.0.0
+version:         0.2.0.0
 synopsis:        Project canonical myque work items into GitHub
 license:         BSD-3-Clause
 author:          Brian Duan
 maintainer:      iceice666@outlook.com
 build-type:      Simple
 
+extra-source-files: README.md CHANGELOG.md
 common warnings
   ghc-options:
     -Wall -Wcompat -Wincomplete-record-updates
@@ -15,6 +16,7 @@ common warnings
 library
   import:           warnings
   exposed-modules:
+    Myque.Github.Body
     Myque.Github.Cli
     Myque.Github.Github
     Myque.Github.Markers
@@ -32,7 +34,7 @@ library
     , directory            >=1.3  && <1.4
     , filelock             >=0.1  && <0.2
     , filepath             >=1.4  && <1.6
-    , myque                ==0.1.0.0
+    , myque                ==0.2.0.0
     , optparse-applicative >=0.18 && <0.20
     , temporary            >=1.3  && <1.4
     , text                 >=2.0  && <2.2

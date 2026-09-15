@@ -23,6 +23,7 @@ import Data.Text.Encoding qualified as TE
 import Myque.Github.Types
 import Myque.Graph (edgesOf)
 import Myque.Render (abbreviate)
+import Myque.Storage (repositoryIdentity)
 import Myque.Store (
     Config (..),
     Layout (..),
@@ -76,10 +77,15 @@ withSnapshot spec action = do
     taskEntries <- listTree root (treeOid tasks)
     config <- loadConfig root taskEntries
     itemsComponents <- validateItemsPath (configItemsDir config)
-    itemsEntry <- descendTree root rootEntries itemsComponents
-    itemEntries <- listTree root (treeOid itemsEntry)
+    itemsEntry <- descendTreeOptional root rootEntries itemsComponents
+    itemEntries <- maybe (pure []) (listTree root . treeOid) itemsEntry
+    terminalEntries <- case findEntry "terminal" taskEntries of
+        Nothing -> pure []
+        Just entry -> requireTree ".tasks/terminal" entry >> listTree root (treeOid entry)
+    when (itemsEntry == Nothing && null terminalEntries) (throwFailure 2 "missing items and terminal trees")
     let prefixed = [entry{treeName = joinPath (itemsComponents <> [treeName entry])} | entry <- itemEntries, takeExtension (treeName entry) == ".md"]
-    selected <- traverse validateItemEntry (sortOn treeName prefixed)
+        terminals = [entry{treeName = ".tasks" </> "terminal" </> treeName entry} | entry <- terminalEntries]
+    selected <- traverse validateItemEntry (sortOn treeName (prefixed <> terminals))
     let oidOrder = unique (map treeOid selected <> maybe [] (pure . treeOid) (findEntry "config.toml" taskEntries))
     blobs <- if null oidOrder then pure Map.empty else readBlobs root oidOrder
     withSystemTempDirectory "myque-gh-snapshot" $ \temporaryRoot -> do
@@ -100,14 +106,17 @@ withSnapshot spec action = do
         let findings = validate store
         unless (null findings) (throwFailure 1 (T.intercalate "\n" (map findingText findings)))
         let relativeSources = Map.map (normalise . makeRelative temporaryRoot) (storeSources store)
+        identity <- repositoryIdentity root
         action
             Snapshot
                 { snapshotSha = sha
+                , snapshotRepository = identity
                 , snapshotSource = spec{sourceRoot = root}
                 , snapshotStore = store
                 , snapshotEdges = edgesOf store
                 , snapshotAbbrev = abbreviate store
                 , snapshotSourcePaths = relativeSources
+                , snapshotRenderedBodies = Map.empty
                 }
 
 -- | Resolve a revision to one immutable commit SHA.
@@ -154,17 +163,18 @@ validateItemsPath raw = do
         throwFailure 1 "configured items path must be a non-empty repository-relative path without .. or .git components"
     pure components
 
-descendTree :: FilePath -> [TreeEntry] -> [FilePath] -> IO TreeEntry
-descendTree _ _ [] = throwFailure 1 "configured items path is empty"
-descendTree _ entries [name] = do
-    entry <- requireEntry ("missing configured items tree: " <> T.pack name) name entries
-    requireTree name entry
-    pure entry
-descendTree root entries (name : rest) = do
-    entry <- requireEntry ("missing configured items tree component: " <> T.pack name) name entries
-    requireTree name entry
-    children <- listTree root (treeOid entry)
-    descendTree root children rest
+-- An absent active directory is normal after retiring the final active item.
+descendTreeOptional :: FilePath -> [TreeEntry] -> [FilePath] -> IO (Maybe TreeEntry)
+descendTreeOptional _ _ [] = pure Nothing
+descendTreeOptional root entries (name : rest) = case findEntry name entries of
+    Nothing -> pure Nothing
+    Just entry -> do
+        requireTree name entry
+        if null rest
+            then pure (Just entry)
+            else do
+                children <- listTree root (treeOid entry)
+                descendTreeOptional root children rest
 
 listTree :: FilePath -> Text -> IO [TreeEntry]
 listTree root oid = do
